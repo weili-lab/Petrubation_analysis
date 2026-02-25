@@ -1,0 +1,11 @@
+# Ignore everything
+*
+
+# Exceptions: Allow the ignore file and code
+!.gitignore
+!*.py
+!*.R
+!*.sh
+
+# Allow directories so Git can find the files above
+!*/
