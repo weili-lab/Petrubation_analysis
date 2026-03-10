@@ -1,8 +1,9 @@
 import scanpy as sc
 import pandas as pd
+import numpy as np
 
 # 1. Load the structure in backed mode
-adata = sc.read_h5ad('ReplogleWeissman2022_K562_gwps.h5ad', backed='r')
+adata = sc.read_h5ad('ReplogleWeissman2022_rpe1.h5ad', backed='r')
 
 print("--- EXPERIMENTAL LOGIC SUMMARY ---")
 
@@ -60,4 +61,40 @@ if hasattr(expression_sample, "toarray"):
 sample_df = pd.DataFrame(expression_sample, columns=genes_sample, index=adata.obs_names[:5])
 print("Sample RNA Expression Matrix (First 5 cells x 5 genes):")
 print(sample_df)
-print("\nBlunt Truth: The numbers in the matrix above are your Single Cell RNA expression values, NOT the metadata columns.")
+
+# ==========================================
+# --- LOG-NORMALIZATION EVALUATION ---
+# ==========================================
+print("\n--- NORMALIZATION STATUS ---")
+
+# Check 1: Metadata analysis
+has_log1p_metadata = 'log1p' in adata.uns
+if has_log1p_metadata:
+    print("Metadata Check: 'log1p' key FOUND in adata.uns.")
+else:
+    print("Metadata Check: 'log1p' key NOT FOUND in adata.uns.")
+
+# Check 2: Numerical distribution analysis
+# Extract 100 cells across all genes to ensure a statistically significant sample
+sample_X = adata[:100, :].X
+if hasattr(sample_X, "toarray"):
+    sample_X = sample_X.toarray()
+
+max_val = np.max(sample_X)
+# Mean of non-zero entries to prevent artificial skewing from matrix sparsity
+mean_val = np.mean(sample_X[sample_X > 0]) 
+
+print(f"\nValue Metrics:")
+print(f"  Maximum matrix value: {max_val:.2f}")
+print(f"  Mean non-zero value:  {mean_val:.2f}")
+
+# The Final Verdict
+print("\nBLUNT TRUTH VERDICT:")
+if max_val < 25 and has_log1p_metadata:
+    print("Confirmed: The data is LOG-NORMALIZED.")
+elif max_val < 25 and not has_log1p_metadata:
+    print("Likely: The data is LOG-NORMALIZED (Matrix contains small floats, but Scanpy metadata is missing).")
+elif max_val > 25 and np.all(sample_X == np.floor(sample_X)):
+    print("Confirmed: The data contains RAW COUNTS (Matrix consists entirely of large integers).")
+else:
+    print("Ambiguous: The numerical distribution does not cleanly align with standard raw or log-normalized profiles. Manual inspection of the matrix is required.") 
