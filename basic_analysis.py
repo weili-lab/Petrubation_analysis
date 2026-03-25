@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 
 # 1. Load the structure in backed mode
-adata = sc.read_h5ad('ReplogleWeissman2022_rpe1.h5ad', backed='r')
+adata = sc.read_h5ad('ReplogleWeissman2022_rpe1_processed.h5ad', backed='r')
 
 print("--- EXPERIMENTAL LOGIC SUMMARY ---")
 

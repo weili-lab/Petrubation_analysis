@@ -10,7 +10,7 @@ import seaborn as sns
 # ==============================================================================
 # 1. USER CONFIGURATION
 # ==============================================================================
-h5ad_filepath    = "/local/projects-t3/lilab/vmenon/PertTF-Reploge-analysis/ReplogleWeissman2022_rpe1.h5ad"
+h5ad_filepath    = "/local/projects-t3/lilab/vmenon/PertTF-Reploge-analysis/ReplogleWeissman2022_rpe1_processed.h5ad"
 output_h5ad_path = "/local/projects-t3/lilab/vmenon/PertTF-Reploge-analysis/ReplogleWeissman2022_rpe1_PSscore.h5ad"
 barcode_filepath = "/local/projects-t3/lilab/vmenon/PertTF-Reploge-analysis/BARCODE_10x_Merged.txt"
 

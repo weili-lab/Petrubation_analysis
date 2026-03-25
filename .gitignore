@@ -6,6 +6,9 @@
 !*.py
 !*.R
 !*.sh
+!*.yaml
+!*.json
+!*.slurm
 
 # Allow directories so Git can find the files above
 !*/
