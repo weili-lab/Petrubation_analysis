@@ -1,0 +1,30 @@
+package:
+  name: pertps
+  version: "0.1.0"
+
+source:
+  path: ..
+
+build:
+  number: 0
+  script: "{{ PYTHON }} -m pip install . --no-deps -vv"
+
+requirements:
+  host:
+    - python >=3.8
+    - pip
+  run:
+    - python >=3.8
+    - numpy
+    - pandas
+    - scanpy
+    - scipy
+    - scikit-learn
+    - statsmodels
+    - matplotlib
+    - tqdm
+
+about:
+  home: https://github.com/yourusername/pertps
+  license: MIT
+  summary: 'Analytical Perturbation Score (PS) calculation and LDA visualization'

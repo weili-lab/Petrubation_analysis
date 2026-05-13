@@ -1,0 +1,19 @@
+name: pert_analysis
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - python>=3.9
+  - numpy
+  - pandas
+  - scanpy>=1.9.0
+  - scipy>=1.10.0
+  - scikit-learn>=1.2.0
+  - statsmodels
+  - matplotlib
+  - tqdm
+  - ipykernel  # Optional: for using this env in Jupyter
+  - pip
+  - pip:
+    - -e .     # Installs your pertps package in editable mode automatically
