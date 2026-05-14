@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 from anndata import AnnData
 
 from perturb_effects.ps_score_exact import (
@@ -43,6 +44,40 @@ def _make_single_perturbation_adata() -> AnnData:
     adata.obs["perturbation"] = ["control", "control", "pertA", "pertA"]
     adata.obs_names = ["ctrl-1", "ctrl-2", "pert-a-1", "pert-a-2"]
     adata.var_names = ["g1", "g2"]
+    return adata
+
+
+def _make_target_strategy_adata(*, include_counts: bool = True) -> AnnData:
+    expression = np.array(
+        [
+            [1.0, 1.0, 0.0, 2.0],
+            [1.0, 1.0, 0.0, 1.0],
+            [1.0, 1.0, 3.0, 0.0],
+            [1.0, 1.0, 3.0, 0.0],
+            [0.0, 2.0, 1.0, 4.0],
+            [0.0, 2.0, 1.0, 4.0],
+        ],
+        dtype=float,
+    )
+    adata = AnnData(X=np.zeros_like(expression))
+    adata.layers["expr"] = expression
+    if include_counts:
+        adata.layers["counts"] = np.array(
+            [
+                [1.0, 1.0, 0.0, 1.0],
+                [1.0, 1.0, 0.0, 1.0],
+                [1.0, 0.0, 2.0, 0.0],
+                [1.0, 0.0, 2.0, 0.0],
+                [0.0, 2.0, 1.0, 4.0],
+                [0.0, 2.0, 1.0, 4.0],
+            ],
+            dtype=float,
+        )
+    adata.obs["perturbation"] = ["control", "control", "pertA", "pertA", "pertB", "pertB"]
+    adata.obs_names = ["ctrl-1", "ctrl-2", "pert-a-1", "pert-a-2", "pert-b-1", "pert-b-2"]
+    adata.var_names = ["g1", "g2", "g3", "g4"]
+    adata.var["highly_variable"] = [True, False, True, False]
+    adata.var["custom_hvg"] = [True, True, False, False]
     return adata
 
 
@@ -199,3 +234,219 @@ def test_scale_score_normalizes_by_column_max_after_scale_factor_division() -> N
     assert np.allclose(scaled_scores.to_numpy(), expected_scaled.to_numpy())
     assert np.isclose(scaled_scores.loc["pert-a-1"], 0.2)
     assert np.isclose(scaled_scores.loc["pert-a-2"], 1.0)
+
+
+def test_provided_target_gene_mapping_deduplicates_and_truncates_by_max() -> None:
+    adata = _make_target_strategy_adata()
+
+    result = run_ps_score_exact_anndata(
+        adata,
+        perturb_column="perturbation",
+        ctrl_name="control",
+        layer="expr",
+        target_genes={
+            "pertA": ["g1", "g1", "g2", "g3"],
+            "pertB": ["g4", "g3", "g4"],
+        },
+        target_gene_min=1,
+        target_gene_max=2,
+        apply_gene_filter=False,
+        apply_quantile_clip=False,
+        scale_score=False,
+    )
+
+    metadata = result.attrs["ps_score_exact"]
+
+    assert metadata["genes_by_perturbation"] == {
+        "pertA": ["g1", "g2"],
+        "pertB": ["g4", "g3"],
+    }
+    assert metadata["union_target_genes"] == ["g1", "g2", "g4", "g3"]
+
+
+@pytest.mark.parametrize(
+    ("target_genes", "target_gene_min", "message"),
+    [
+        ({"pertA": ["g1", "missing"]}, 1, "Unknown target genes requested"),
+        ({"pertA": ["g1", "g1"]}, 2, "Need at least 2 target genes"),
+    ],
+)
+def test_provided_target_genes_raise_for_missing_or_too_few_genes(
+    target_genes: dict[str, list[str]],
+    target_gene_min: int,
+    message: str,
+) -> None:
+    adata = _make_target_strategy_adata()
+
+    with pytest.raises(ValueError, match=message):
+        run_ps_score_exact_anndata(
+            adata,
+            perturb_column="perturbation",
+            ctrl_name="control",
+            layer="expr",
+            perturbations=["pertA"],
+            target_genes=target_genes,
+            target_gene_min=target_gene_min,
+            target_gene_max=4,
+            apply_gene_filter=False,
+            apply_quantile_clip=False,
+            scale_score=False,
+        )
+
+
+def test_hvg_target_gene_mode_reuses_requested_hvg_key_for_each_perturbation() -> None:
+    adata = _make_target_strategy_adata()
+
+    result = run_ps_score_exact_anndata(
+        adata,
+        perturb_column="perturbation",
+        ctrl_name="control",
+        layer="expr",
+        target_gene_source="hvg",
+        hvg_key="custom_hvg",
+        target_gene_min=1,
+        target_gene_max=3,
+        apply_gene_filter=False,
+        apply_quantile_clip=False,
+        scale_score=False,
+    )
+
+    metadata = result.attrs["ps_score_exact"]
+
+    assert metadata["target_gene_source_detail"] == {"mode": "hvg", "hvg_key": "custom_hvg"}
+    assert metadata["genes_by_perturbation"] == {
+        "pertA": ["g1", "g2"],
+        "pertB": ["g1", "g2"],
+    }
+
+
+def test_hvg_target_gene_mode_errors_when_no_hvgs_exist() -> None:
+    adata = _make_target_strategy_adata()
+    adata.var["empty_hvg"] = [False, False, False, False]
+
+    with pytest.raises(ValueError, match="does not contain any HVGs"):
+        run_ps_score_exact_anndata(
+            adata,
+            perturb_column="perturbation",
+            ctrl_name="control",
+            layer="expr",
+            target_gene_source="hvg",
+            hvg_key="empty_hvg",
+            target_gene_min=1,
+            target_gene_max=3,
+            apply_gene_filter=False,
+            apply_quantile_clip=False,
+            scale_score=False,
+        )
+
+
+def test_scanpy_target_gene_mode_selects_non_empty_genes_when_available() -> None:
+    pytest.importorskip("scanpy")
+    adata = _make_target_strategy_adata(include_counts=False)
+
+    result = run_ps_score_exact_anndata(
+        adata,
+        perturb_column="perturbation",
+        ctrl_name="control",
+        layer="expr",
+        perturbations=["pertA"],
+        target_gene_source="scanpy_de",
+        target_gene_min=1,
+        target_gene_max=2,
+        apply_gene_filter=False,
+        apply_quantile_clip=False,
+        scale_score=False,
+    )
+
+    metadata = result.attrs["ps_score_exact"]
+
+    assert metadata["target_gene_source"] == "scanpy_de"
+    assert metadata["target_gene_source_detail"] == {"mode": "scanpy_de", "layer": "expr"}
+    assert metadata["genes_by_perturbation"]["pertA"]
+    assert set(metadata["genes_by_perturbation"]["pertA"]).issubset(set(adata.var_names))
+
+
+def test_gene_filter_uses_counts_layer_when_available() -> None:
+    adata = _make_target_strategy_adata(include_counts=True)
+
+    result = run_ps_score_exact_anndata(
+        adata,
+        perturb_column="perturbation",
+        ctrl_name="control",
+        layer="expr",
+        perturbations=["pertA"],
+        target_genes=["g1", "g2"],
+        target_gene_min=1,
+        target_gene_max=4,
+        apply_gene_filter=True,
+        gene_filter_min_fraction=0.75,
+        apply_quantile_clip=False,
+        scale_score=False,
+    )
+
+    metadata = result.attrs["ps_score_exact"]
+
+    assert metadata["gene_filter_source"] == "counts"
+    assert metadata["genes_by_perturbation"]["pertA"] == ["g1"]
+    assert metadata["gene_filter_metadata"]["target_gene_counts_before_filter"] == {"pertA": 2}
+    assert metadata["gene_filter_metadata"]["target_gene_counts_after_filter"] == {"pertA": 1}
+
+
+def test_gene_filter_falls_back_to_selected_expression_layer_without_counts() -> None:
+    adata = _make_target_strategy_adata(include_counts=False)
+
+    result = run_ps_score_exact_anndata(
+        adata,
+        perturb_column="perturbation",
+        ctrl_name="control",
+        layer="expr",
+        perturbations=["pertA"],
+        target_genes=["g1", "g2"],
+        target_gene_min=1,
+        target_gene_max=4,
+        apply_gene_filter=True,
+        gene_filter_min_fraction=0.75,
+        apply_quantile_clip=False,
+        scale_score=False,
+    )
+
+    metadata = result.attrs["ps_score_exact"]
+
+    assert metadata["gene_filter_source"] == "expr"
+    assert metadata["genes_by_perturbation"]["pertA"] == ["g1", "g2"]
+    assert metadata["gene_filter_metadata"]["target_gene_counts_before_filter"] == {"pertA": 2}
+    assert metadata["gene_filter_metadata"]["target_gene_counts_after_filter"] == {"pertA": 2}
+
+
+def test_quantile_clipping_is_optional_at_the_requested_095_quantile() -> None:
+    adata = _make_layer_selection_adata()
+
+    clipped = run_ps_score_exact_anndata(
+        adata,
+        perturb_column="perturbation",
+        ctrl_name="control",
+        layer="expr",
+        target_genes={"pertA": ["g3"], "pertB": ["g3"]},
+        target_gene_min=1,
+        target_gene_max=2,
+        apply_gene_filter=False,
+        apply_quantile_clip=True,
+        clip_quantile=0.95,
+        scale_score=False,
+    )
+    unclipped = run_ps_score_exact_anndata(
+        adata,
+        perturb_column="perturbation",
+        ctrl_name="control",
+        layer="expr",
+        target_genes={"pertA": ["g3"], "pertB": ["g3"]},
+        target_gene_min=1,
+        target_gene_max=2,
+        apply_gene_filter=False,
+        apply_quantile_clip=False,
+        scale_score=False,
+    )
+
+    assert np.allclose(clipped.attrs["ps_score_exact"]["clip_values"], [385.0])
+    assert clipped.attrs["ps_score_exact"]["clip_quantile"] == 0.95
+    assert unclipped.attrs["ps_score_exact"]["clip_values"] is None
