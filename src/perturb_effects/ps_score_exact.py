@@ -1,4 +1,11 @@
-"""Exact scMAGeCK-style PS scores for single-label AnnData inputs."""
+"""Exact scMAGeCK-style PS scores for single-label AnnData inputs.
+
+This path is exact for the single-label scMAGeCK PS-score objective after target
+genes are chosen, using an AnnData-derived design matrix, ridge LR beta solve,
+and bounded scalar scores. It does not claim Seurat `FindMarkers` parity for
+target-gene selection and does not support multi-perturbation-per-cell inputs.
+Use `ps_score.py` for the existing compact signature-style PS-score path.
+"""
 
 from __future__ import annotations
 
@@ -54,7 +61,13 @@ def run_ps_score_exact_anndata(
     score_solver: str = "closed_form",
     return_wide: bool = False,
 ) -> pd.DataFrame:
-    """Run the exact single-label scMAGeCK-style PS-score workflow on AnnData."""
+    """Run the exact single-label scMAGeCK-style PS-score workflow on AnnData.
+
+    Exactness here is limited to the masked ridge-beta-plus-bounded-score
+    objective for one perturbation label per cell after target genes are
+    resolved. This function does not add multi-guide support or full Seurat
+    target-selection parity.
+    """
 
     _validate_adata_like(adata)
     if not isinstance(perturb_column, str) or not perturb_column:
