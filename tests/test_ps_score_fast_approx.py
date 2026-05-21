@@ -87,6 +87,42 @@ def _make_observed_only_adata() -> AnnData:
     return adata
 
 
+def _make_mixed_label_adata() -> AnnData:
+    counts = np.array(
+        [
+            [5.0, 5.0],
+            [0.0, 0.0],
+            [9.0, 1.0],
+            [8.0, 2.0],
+            [1.0, 9.0],
+            [2.0, 8.0],
+        ],
+        dtype=float,
+    )
+    adata = AnnData(X=sparse.csr_matrix(counts))
+    adata.obs["perturbation"] = ["control", np.nan, "pertA", "pertA", "pertB", "pertB"]
+    adata.var_names = ["g1", "g2"]
+    return adata
+
+
+def _make_clip_demo_adata() -> AnnData:
+    counts = np.array(
+        [
+            [5.0, 5.0],
+            [5.0, 5.0],
+            [10.0, 0.0],
+            [7.0, 3.0],
+            [0.0, 10.0],
+            [3.0, 7.0],
+        ],
+        dtype=float,
+    )
+    adata = AnnData(X=sparse.csr_matrix(counts))
+    adata.obs["perturbation"] = ["control", "control", "pertA", "pertA", "pertB", "pertB"]
+    adata.var_names = ["g1", "g2"]
+    return adata
+
+
 def test_fast_approx_scores_have_expected_shape_and_zero_invalid_rows() -> None:
     result = run_ps_score_fast_approx_anndata(
         _make_fast_approx_adata(),
@@ -133,10 +169,103 @@ def test_fast_approx_scores_use_only_the_observed_perturbation_signature() -> No
     assert scores["pertB"]["selected_gene_count"] == 1
 
 
+def test_fast_approx_handles_mixed_string_and_nan_labels() -> None:
+    result = run_ps_score_fast_approx_anndata(
+        _make_mixed_label_adata(),
+        perturb_column="perturbation",
+        ctrl_name="control",
+        top_n=1,
+        chunk_size=3,
+        min_cells_per_perturbation=2,
+    )
+
+    assert result.scores.shape == (6, 1)
+    assert np.isclose(result.scores[1, 0], 0.0)
+    assert result.metadata["invalid_label_count"] == 1
+    assert result.valid_mask.tolist() == [False, False, True, True, True, True]
+
+
+def test_fast_approx_default_options_match_explicit_defaults() -> None:
+    implicit = run_ps_score_fast_approx_anndata(
+        _make_observed_only_adata(),
+        perturb_column="perturbation",
+        ctrl_name="control",
+        top_n=1,
+        chunk_size=4,
+        min_cells_per_perturbation=2,
+    )
+    explicit = run_ps_score_fast_approx_anndata(
+        _make_observed_only_adata(),
+        perturb_column="perturbation",
+        ctrl_name="control",
+        top_n=1,
+        chunk_size=4,
+        min_cells_per_perturbation=2,
+        target_basis="per_perturbation",
+        clip_quantile=None,
+    )
+
+    assert np.allclose(implicit.scores, explicit.scores)
+    assert implicit.valid_mask.tolist() == explicit.valid_mask.tolist()
+    assert implicit.metadata["signature_metadata"] == explicit.metadata["signature_metadata"]
+
+
+def test_fast_approx_union_basis_uses_ordered_shared_union() -> None:
+    result = run_ps_score_fast_approx_anndata(
+        _make_observed_only_adata(),
+        perturb_column="perturbation",
+        ctrl_name="control",
+        top_n=1,
+        chunk_size=4,
+        min_cells_per_perturbation=2,
+        target_basis="union",
+    )
+
+    metadata = result.metadata
+    ordered_targets = [
+        metadata["signature_metadata"]["pertA"]["target_genes"][0],
+        metadata["signature_metadata"]["pertB"]["target_genes"][0],
+    ]
+    assert metadata["target_basis"] == "union"
+    assert metadata["union_target_genes"] == ordered_targets
+    assert metadata["union_target_gene_count"] == 2
+    assert metadata["signature_metadata"]["pertA"]["selected_genes"] == ordered_targets
+    assert metadata["signature_metadata"]["pertB"]["selected_genes"] == ordered_targets
+
+
+def test_fast_approx_histclip_changes_signature_metadata_and_scores() -> None:
+    unclipped = run_ps_score_fast_approx_anndata(
+        _make_clip_demo_adata(),
+        perturb_column="perturbation",
+        ctrl_name="control",
+        top_n=1,
+        chunk_size=3,
+        min_cells_per_perturbation=2,
+    )
+    clipped = run_ps_score_fast_approx_anndata(
+        _make_clip_demo_adata(),
+        perturb_column="perturbation",
+        ctrl_name="control",
+        top_n=1,
+        chunk_size=3,
+        min_cells_per_perturbation=2,
+        clip_quantile=0.5,
+        clip_bins=16,
+    )
+
+    assert clipped.metadata["quantile_clip"] is True
+    assert clipped.metadata["clip_quantile"] == 0.5
+    assert clipped.metadata["clip_bins"] == 16
+    assert clipped.metadata["clip_method"] == "streaming_histogram"
+    assert clipped.metadata["clip_value_summary"]["count"] == clipped.metadata["union_target_gene_count"]
+    assert clipped.metadata["signature_metadata"]["pertA"]["beta_norm"] < unclipped.metadata["signature_metadata"]["pertA"]["beta_norm"]
+    assert not np.allclose(clipped.scores, unclipped.scores)
+
+
 def test_fast_approx_main_writes_manifest_and_outputs(tmp_path) -> None:
     dataset_path = tmp_path / "toy.h5ad"
     output_dir = tmp_path / "fast-approx"
-    _make_fast_approx_adata().write_h5ad(dataset_path)
+    _make_clip_demo_adata().write_h5ad(dataset_path)
 
     report = main(
         [
@@ -148,12 +277,16 @@ def test_fast_approx_main_writes_manifest_and_outputs(tmp_path) -> None:
             "perturbation",
             "--ctrl-name",
             "control",
-            "--null-label",
-            "unassigned",
             "--top-n",
             "1",
             "--chunk-size",
             "3",
+            "--target-basis",
+            "union",
+            "--clip-quantile",
+            "0.5",
+            "--clip-bins",
+            "16",
         ]
     )
 
@@ -166,6 +299,11 @@ def test_fast_approx_main_writes_manifest_and_outputs(tmp_path) -> None:
     assert valid_mask_path.exists()
     saved = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert saved["dataset_path"] == str(dataset_path)
-    assert tuple(saved["score_vector_shape"]) == (8, 1)
+    assert tuple(saved["score_vector_shape"]) == (6, 1)
+    assert saved["target_basis"] == "union"
+    assert saved["clip_quantile"] == 0.5
+    assert saved["clip_bins"] == 16
+    assert saved["clip_method"] == "streaming_histogram"
+    assert saved["union_target_gene_count"] == 2
     assert report["score_output_paths"]["normalized_scores"] == str(score_path)
-    assert np.load(score_path).shape == (8, 1)
+    assert np.load(score_path).shape == (6, 1)
