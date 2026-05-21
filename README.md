@@ -1,6 +1,6 @@
 # Perturbation Analysis 
 
-A Python pipeline for quantifying and visualizing transcription factor (TF) perturbation efficiency in single-cell CRISPR screen (Perturb-seq) data. The pipeline computes per-cell **Perturbation Scores (PS)** using a translated scMAGeCK EM algorithm, projects cells onto a shared LDA-based UMAP, and generates diagnostic scatter plots for 50 target TFs.
+A Python pipeline for quantifying and visualizing transcription factor (TF) perturbation efficiency in single-cell CRISPR screen (Perturb-seq) data. The pipeline computes per-cell **Perturbation Scores (PS)** using a translated scMAGeCK EM algorithm, projects cells onto a shared LDA-based UMAP, and generates diagnostic scatter plots for 50 target TFs.This PS score is inspired from R version. 
 
 ---
 
