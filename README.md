@@ -8,43 +8,31 @@ A Python pipeline for quantifying and visualizing transcription factor (TF) pert
 
 ```
 Petrubation_analysis/
-├── README.md        # This file
-└── demo/            # All analysis code, data, and example outputs (see below)
+├── README.md                # This file
+├── PertPS.py                # Main analysis pipeline
+├── pertps_project/          # Local `pertps` Python package
+└── demo/                    # Example input data and output plots
+    ├── PertTF_Subset_100MB.h5ad
+    ├── BARCODE_10x_Merged.txt
+    ├── CTNNB1_Fixed_LDA.png
+    ├── EZH2_Fixed_LDA.png
+    └── SMARCC1_Fixed_LDA.png
 ```
 
 ---
 
 ## The `demo/` Folder
 
-The `demo/` folder contains everything needed to run the full perturbation analysis pipeline end-to-end. Here is what it includes and what each piece does:
+The `demo/` folder contains example input files and example output plots to help you understand what the pipeline expects and produces.
 
-### Input Data
+### Example Input Data
 
 | File | Description |
 |------|-------------|
 | `PertTF_Subset_100MB.h5ad` | AnnData object with 15,000 single cells and a full gene expression matrix (gzip-compressed, ~100 MB). This is the primary input to the pipeline. |
 | `BARCODE_10x_Merged.txt` | Tab-separated file mapping each cell barcode to its CRISPR perturbation target gene. The `cell` column contains barcodes; the `gene` column contains the target gene name. Library prefixes (e.g. `S1L1_`, `S2L2_`) are stripped automatically at runtime. |
 
-### Scripts
-
-| File | Description |
-|------|-------------|
-| `PertPS.py` | **Main analysis pipeline.** Loads the AnnData and barcode table, maps barcodes to perturbation identities, computes a Perturbation Score (PS) for each of the 50 target TFs via an EM algorithm (adapted from scMAGeCK), trains a global LDA model to produce a shared UMAP embedding, and generates all output plots and score tables. |
-
-### `pertps_project/`
-
-The local Python package that `PertPS.py` imports. It provides:
-- `PerturbAnalyzer` — the core class that runs the EM-based PS score calculation and LDA training.
-- `plot_ps_on_lda` — renders per-gene PS scores overlaid on the shared LDA UMAP.
-- `plot_global_summary` — renders a global UMAP highlighting all high-confidence knockdown cells (PS > 0.8).
-
-Install it before running the pipeline:
-```bash
-pip install -e demo/pertps_project/
-```
-
-You can directly call as seen inside the PertPS.py file
-### Example Validation Plots
+### Example Output Plots
 
 Three example output plots are included to show what a successful knockdown looks like on the fixed LDA UMAP:
 
@@ -97,7 +85,6 @@ pip install -e demo/pertps_project/
 Run the pipeline from inside the `demo/` folder:
 
 ```bash
-cd demo
 python PertPS.py
 ```
 
