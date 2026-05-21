@@ -1,4 +1,4 @@
-# Perturbation Analysis — `weili-lab/Petrubation_analysis`
+# Perturbation Analysis 
 
 A Python pipeline for quantifying and visualizing transcription factor (TF) perturbation efficiency in single-cell CRISPR screen (Perturb-seq) data. The pipeline computes per-cell **Perturbation Scores (PS)** using a translated scMAGeCK EM algorithm, projects cells onto a shared LDA-based UMAP, and generates diagnostic scatter plots for 50 target TFs.
 
@@ -43,6 +43,7 @@ Install it before running the pipeline:
 pip install -e demo/pertps_project/
 ```
 
+You can directly call as seen inside the PertPS.py file
 ### Example Validation Plots
 
 Three example output plots are included to show what a successful knockdown looks like on the fixed LDA UMAP:
@@ -69,6 +70,7 @@ This project analyzes a 10x Genomics CRISPR perturbation screen targeting 50 tra
 
 ## Target Genes (50 TFs)
 
+The below are the list , you can have your own list or set of files that you are interested to examine
 ```
 SMARCC1  TCF7L2   HMGA2    AFF4     HIF1A    TCF7L1   SMARCA4  CTNNB1
 NFIB     TCF12    SMAD3    EZH2     REST     HDAC1    ARID1B   SMARCB1
@@ -113,10 +115,10 @@ The script will:
 
 ## Output Description
 
-### `plots_fixed_lda/` (generated)
+### `plots_fixed_lda/` (generated | not shown here due to size)
 UMAP plots with PS scores overlaid on a shared LDA embedding trained on all perturbed cells. A global summary plot highlights high-confidence knockdown cells (PS > 0.8).
 
-### `plots_scatter_validation/` (generated)
+### `plots_scatter_validation/` (generated | not shown here due to size)
 Labeled quadrant scatter plots (Perturbation Score vs. normalized target gene expression) for each TF. Cells are classified into four quadrants:
 
 | Quadrant | Interpretation |
@@ -147,6 +149,14 @@ Labeled quadrant scatter plots (Perturbation Score vs. normalized target gene ex
 - The negative control population is labeled `"Non-Targeting"` in the barcode table.
 - For better result please use the complete h5ad file , the above one is just example 
 ---
+
+
+### Citation
+Song B, Liu D, Dai W, McMyn NF, Wang Q, Yang D, Krejci A, Vasilyev A, Untermoser N, Loregger A, Song D, Williams B, Rosen B, Cheng X, Chao L, Kale HT, Zhang H, Diao Y, Bürckstümmer T, Siliciano JD, Li JJ, Siliciano RF, Huangfu D, Li W. Decoding heterogeneous single-cell perturbation responses. Nat Cell Biol. 2025 Mar;27(3):493-504. doi: 10.1038/s41556-025-01626-9. Epub 2025 Feb 26. PMID: 40011559; PMCID: PMC11906366.
+
+pertTF: context-aware AI modeling for genome-scale and cross-system perturbation prediction
+Yangqi Su, Dingyu Liu, Vipin Menon, Bicna Song, Samuel Boccara, Nan Zhang, Huan Zhao, Jiahui Hazel Zhao, Lei Wang, Nan Hu, Mpathi Nzima, Alon Katz, Bharath Kumar Swargam, Seth A. Ament, Yarui Diao, Hanrui Zhang, Lumen Chao, Gary Hon, Danwei Huangfu, Wei Li
+bioRxiv 2026.03.12.711379; doi: https://doi.org/10.64898/2026.03.12.711379
 
 ## License
 
