@@ -11,9 +11,9 @@ import seaborn as sns
 # ==============================================================================
 # 1. USER CONFIGURATION
 # ==============================================================================
-h5ad_filepath    = "./PertTF_Subset_100MB.h5ad"
-output_h5ad_path = "./PertTF_Subset_PS_Scores.h5ad"
-barcode_filepath = "./BARCODE_10x_Merged.txt"
+h5ad_filepath    = "./demo/PertTF_Subset_100MB.h5ad"
+output_h5ad_path = "./demo/PertTF_Subset_PS_Scores.h5ad"
+barcode_filepath = "./demo/BARCODE_10x_Merged.txt"
 negative_ctrl    = "Non-Targeting"
 
 gene_list = [
