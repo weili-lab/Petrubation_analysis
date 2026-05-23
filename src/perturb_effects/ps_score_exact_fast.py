@@ -122,21 +122,32 @@ def run_ps_score_exact_fast(
     stage_start = time.perf_counter()
 
     full_stats_seconds = 0.0
+    clip_threshold_seconds = 0.0
     full_stats: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None] | None = None
     linear_sums: np.ndarray | None = None
-    if target_mode == "union_deg":
+    all_gene_clip_values = None
+    if target_mode == "union_deg" or clip_quantile is not None:
         stats_start = time.perf_counter()
-        full_stats = _collect_group_stats(
+        sums, squared_sums, counts, linear_sums, all_gene_clip_values = _collect_group_stats(
             matrix,
             guides=parsed.guides,
             control_mask=parsed.control_mask,
             chunk_size=chunk_size,
             target_sum=target_sum,
-            collect_linear_sums=logfc_threshold is not None,
+            collect_moments=target_mode == "union_deg",
+            collect_linear_sums=target_mode == "union_deg" and logfc_threshold is not None,
+            clip_quantile=clip_quantile,
+            clip_bins=clip_bins,
+            clip_model_mask=parsed.model_mask if clip_quantile is not None else None,
         )
-        full_stats_seconds = time.perf_counter() - stats_start
-        counts = full_stats[2]
-        linear_sums = full_stats[3]
+        first_pass_seconds = time.perf_counter() - stats_start
+        if target_mode == "union_deg":
+            if sums is None or squared_sums is None:
+                raise ValueError("union_deg target mode requires group statistics")
+            full_stats = (sums, squared_sums, counts, linear_sums)
+            full_stats_seconds = first_pass_seconds
+        else:
+            clip_threshold_seconds = first_pass_seconds
     else:
         counts = _group_counts(parsed.guides, parsed.control_mask)
     _check_group_counts(counts, parsed.perturbations)
@@ -156,21 +167,7 @@ def run_ps_score_exact_fast(
     union_gene_indices = _ordered_union_indices(targets.values())
     background_enabled = background_cluster_codes is not None
 
-    clip_values = None
-    clip_threshold_seconds = 0.0
-    if clip_quantile is not None:
-        clip_start = time.perf_counter()
-        clip_values = _estimate_histogram_clip_values(
-            matrix,
-            model_rows=parsed.model_mask,
-            union_gene_indices=union_gene_indices,
-            model_cell_count=int(np.count_nonzero(parsed.model_mask)),
-            chunk_size=chunk_size,
-            target_sum=target_sum,
-            quantile=clip_quantile,
-            bins=clip_bins,
-        )
-        clip_threshold_seconds = time.perf_counter() - clip_start
+    clip_values = None if all_gene_clip_values is None else all_gene_clip_values[union_gene_indices]
 
     clipped_stats_seconds = 0.0
     ridge_stats_seconds = 0.0
@@ -185,7 +182,7 @@ def run_ps_score_exact_fast(
             beta_sums = full_stats[0][:, union_gene_indices]
         else:
             clipped_stats_start = time.perf_counter()
-            beta_sums, _, counts, _ = _collect_group_stats(
+            beta_sums, _, counts, _, _ = _collect_group_stats(
                 matrix,
                 guides=parsed.guides,
                 control_mask=parsed.control_mask,
@@ -762,16 +759,36 @@ def _collect_group_stats(
     target_sum: float,
     gene_indices: np.ndarray | None = None,
     clip_values: np.ndarray | None = None,
+    collect_moments: bool = True,
     collect_linear_sums: bool = False,
     cluster_codes: np.ndarray | None = None,
     background_stats: _BackgroundStats | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
+    clip_quantile: float | None = None,
+    clip_bins: int = DEFAULT_CLIP_BINS,
+    clip_model_mask: np.ndarray | None = None,
+) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray, np.ndarray | None, np.ndarray | None]:
+    if collect_linear_sums and not collect_moments:
+        raise ValueError("linear sums require group moments")
+    if clip_quantile is not None and gene_indices is not None:
+        raise ValueError("histogram clipping collection requires all genes")
     feature_count = int(matrix.shape[1] if gene_indices is None else gene_indices.shape[0])
     group_count = guides.shape[1] + 1
-    sums = np.zeros((group_count, feature_count), dtype=np.float64)
-    squared_sums = np.zeros_like(sums)
+    sums = np.zeros((group_count, feature_count), dtype=np.float64) if collect_moments else None
+    squared_sums = np.zeros_like(sums) if sums is not None else None
     linear_sums = np.zeros_like(sums) if collect_linear_sums else None
     counts = np.zeros(group_count, dtype=np.int64)
+    hist = None
+    nonzero_counts = None
+    clip_model_cell_count = 0
+    max_value = float(np.log1p(target_sum))
+    if clip_quantile is not None:
+        if clip_model_mask is None:
+            raise ValueError("clip_quantile requires clip_model_mask")
+        clip_model_cell_count = int(np.count_nonzero(clip_model_mask))
+        if clip_model_cell_count <= 0:
+            raise ValueError("Cannot estimate clip values without model cells")
+        hist = np.zeros((feature_count, int(clip_bins)), dtype=np.uint32)
+        nonzero_counts = np.zeros(feature_count, dtype=np.int64)
     for start, stop, chunk in _iter_chunks(
         matrix,
         n_obs=guides.shape[0],
@@ -787,14 +804,26 @@ def _collect_group_stats(
                 _add_group_sums(chunk[chunk_control], row=0, sums=linear_sums)
             _add_multilabel_group_sums(chunk, guides[start:stop], sums=linear_sums)
             chunk = _apply_log1p_chunk(chunk)
+        if hist is not None and nonzero_counts is not None and clip_model_mask is not None:
+            model_mask = clip_model_mask[start:stop]
+            if np.any(model_mask):
+                _accumulate_nonzero_histogram(chunk[model_mask], hist=hist, nonzero_counts=nonzero_counts, max_value=max_value)
         if background_stats is not None:
             if cluster_codes is None:
                 raise ValueError("background_stats requires cluster_codes")
             _add_background_stats(chunk, guides[start:stop], chunk_control, cluster_codes[start:stop], background_stats)
-        if np.any(chunk_control):
+        if sums is None or squared_sums is None:
+            counts[0] += int(np.count_nonzero(chunk_control))
+            counts[1:] += np.asarray(guides[start:stop].sum(axis=0)).ravel().astype(np.int64, copy=False)
+        elif np.any(chunk_control):
             _add_group_stats(chunk[chunk_control], row=0, sums=sums, squared_sums=squared_sums, counts=counts)
-        _add_multilabel_group_stats(chunk, guides[start:stop], sums=sums, squared_sums=squared_sums, counts=counts)
-    return sums, squared_sums, counts, linear_sums
+        if sums is not None and squared_sums is not None:
+            _add_multilabel_group_stats(chunk, guides[start:stop], sums=sums, squared_sums=squared_sums, counts=counts)
+    clip_values = None
+    if hist is not None and nonzero_counts is not None:
+        zero_counts = np.full(feature_count, clip_model_cell_count, dtype=np.int64) - nonzero_counts
+        clip_values = _histogram_quantiles(hist, zero_counts=zero_counts, total_count=clip_model_cell_count, quantile=float(clip_quantile), max_value=max_value)
+    return sums, squared_sums, counts, linear_sums, clip_values
 
 
 def _score_single_label(
@@ -1026,36 +1055,6 @@ def _apply_log1p_chunk(matrix: Any) -> Any:
         return matrix
     np.log1p(matrix, out=matrix)
     return matrix
-
-
-def _estimate_histogram_clip_values(
-    matrix: Any,
-    *,
-    model_rows: np.ndarray,
-    union_gene_indices: np.ndarray,
-    model_cell_count: int,
-    chunk_size: int,
-    target_sum: float,
-    quantile: float,
-    bins: int,
-) -> np.ndarray:
-    if model_cell_count <= 0:
-        raise ValueError("Cannot estimate clip values without model cells")
-    max_value = float(np.log1p(target_sum))
-    hist = np.zeros((union_gene_indices.shape[0], bins), dtype=np.uint32)
-    nonzero_counts = np.zeros(union_gene_indices.shape[0], dtype=np.int64)
-    for start, stop, chunk in _iter_chunks(
-        matrix,
-        n_obs=model_rows.shape[0],
-        chunk_size=chunk_size,
-        target_sum=target_sum,
-        gene_indices=union_gene_indices,
-    ):
-        model_mask = model_rows[start:stop]
-        if np.any(model_mask):
-            _accumulate_nonzero_histogram(chunk[model_mask], hist=hist, nonzero_counts=nonzero_counts, max_value=max_value)
-    zero_counts = np.full(union_gene_indices.shape[0], model_cell_count, dtype=np.int64) - nonzero_counts
-    return _histogram_quantiles(hist, zero_counts=zero_counts, total_count=model_cell_count, quantile=quantile, max_value=max_value)
 
 
 def _accumulate_nonzero_histogram(matrix: Any, *, hist: np.ndarray, nonzero_counts: np.ndarray, max_value: float) -> None:
