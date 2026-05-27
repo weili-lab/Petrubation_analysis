@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import inspect
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -236,7 +238,11 @@ def test_single_background_correction_uses_cluster_control_baseline() -> None:
     assert np.allclose(result.scores[perturb_rows, 0] * 10.0, np.clip(expected_raw, 0.0, 10.0))
 
 
-def test_single_output_csv_marks_controls_and_unselected_cells(tmp_path) -> None:
+def test_python_api_has_no_output_dir_write_option() -> None:
+    assert "output_dir" not in inspect.signature(run_ps_score_exact_fast).parameters
+
+
+def test_single_cli_output_csv_marks_controls_and_unselected_cells(tmp_path) -> None:
     counts = np.asarray(
         [
             [5.0, 1.0],
@@ -254,18 +260,30 @@ def test_single_output_csv_marks_controls_and_unselected_cells(tmp_path) -> None
         ),
         var=pd.DataFrame({"highly_variable": [True, True]}, index=["g1", "g2"]),
     )
+    dataset_path = tmp_path / "tiny.h5ad"
     output_dir = tmp_path / "out"
+    adata.write_h5ad(dataset_path)
 
-    manifest = run_ps_score_exact_fast(
-        adata,
-        mode="single",
-        output_dir=output_dir,
-        perturb_column="perturbation",
-        ctrl_name="control",
-        perturbations=["pertA"],
-        target_mode="hvg",
-        chunk_size=2,
-        scale_score=False,
+    manifest = main(
+        [
+            "--mode",
+            "single",
+            "--dataset-path",
+            str(dataset_path),
+            "--output-dir",
+            str(output_dir),
+            "--perturb-column",
+            "perturbation",
+            "--ctrl-name",
+            "control",
+            "--perturbation",
+            "pertA",
+            "--target-mode",
+            "hvg",
+            "--chunk-size",
+            "2",
+            "--no-scale-score",
+        ]
     )
 
     score_path = output_dir / "ps-score-exact-fast.csv"

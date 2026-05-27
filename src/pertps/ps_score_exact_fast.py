@@ -89,7 +89,6 @@ def run_ps_score_exact_fast(
     mode: Literal["single", "multilabel"] = "single",
     perturb_column: str,
     ctrl_name: str,
-    output_dir: str | Path | None = None,
     layer: str | None = None,
     perturbations: Sequence[str] | None = None,
     target_mode: Literal["union_deg", "hvg"] = "union_deg",
@@ -106,7 +105,7 @@ def run_ps_score_exact_fast(
     clip_quantile: float | None = None,
     clip_bins: int = DEFAULT_CLIP_BINS,
     show_progress: bool = False,
-) -> ExactFastPsResult | ExactFastMultiLabelPsResult | dict[str, Any]:
+) -> ExactFastPsResult | ExactFastMultiLabelPsResult:
     """Run exact-fast PS scoring from an AnnData object or backed h5ad path."""
 
     assert clip_quantile is None or 0.0 < clip_quantile <= 1.0
@@ -426,12 +425,10 @@ def run_ps_score_exact_fast(
             metadata=metadata,
         )
 
-    if output_dir is None:
-        return result
-    return write_ps_score_exact_fast_output(result, output_dir=output_dir, dataset_path=dataset_path)
+    return result
 
 
-def write_ps_score_exact_fast_output(
+def _write_ps_score_exact_fast_output(
     result: ExactFastPsResult | ExactFastMultiLabelPsResult,
     *,
     output_dir: str | Path,
@@ -518,7 +515,6 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
     result = run_ps_score_exact_fast(
         args.dataset_path,
         mode=args.mode,
-        output_dir=args.output_dir,
         perturb_column=args.perturb_column,
         ctrl_name=args.ctrl_name,
         layer=args.layer,
@@ -538,9 +534,7 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
         clip_bins=args.clip_bins,
         show_progress=args.progress,
     )
-    if not isinstance(result, dict):
-        raise TypeError("CLI run did not return an output manifest")
-    return result
+    return _write_ps_score_exact_fast_output(result, output_dir=args.output_dir, dataset_path=args.dataset_path)
 
 
 def cli(argv: Sequence[str] | None = None) -> None:
@@ -1162,7 +1156,6 @@ __all__ = [
     "cli",
     "main",
     "run_ps_score_exact_fast",
-    "write_ps_score_exact_fast_output",
 ]
 
 

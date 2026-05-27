@@ -101,15 +101,19 @@ ps_out/ps-score-exact-fast-manifest.json
 ```python
 from pertps import run_ps_score_exact_fast
 
-manifest = run_ps_score_exact_fast(
+result = run_ps_score_exact_fast(
     "input.h5ad",
-    output_dir="ps_out",
     mode="single",
     perturb_column="perturbation",
     ctrl_name="control",
     show_progress=True,
 )
+
+scores = result.scores
+metadata = result.metadata
 ```
+
+The Python API only returns an in-memory result. Use the `ps_score_exact_fast` CLI when you want CSV and manifest files written to disk.
 
 ## Legacy PS_python Pipeline
 
