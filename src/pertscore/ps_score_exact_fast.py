@@ -1,0 +1,1170 @@
+"""Fast exact PS scores from backed AnnData streams.
+
+Perturbations always come from one obs column. In single mode each non-control
+label is one perturbation; in multi-label mode labels like `pertA+pertB` are
+parsed as active perturbation sets. Target genes are either union DEGs selected
+from streamed Welch statistics, or an existing `adata.var['highly_variable']`
+set.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import time
+from collections.abc import Sequence
+from dataclasses import dataclass
+from itertools import product
+from pathlib import Path
+from typing import Any, Literal
+
+import anndata as ad
+import numpy as np
+from scipy import sparse
+from scipy.optimize import minimize
+from scipy.sparse.linalg import spsolve
+
+from .stats import column_sums, log2_fold_change, top_k_indices, welch_t_scores_from_stats
+from .stream import (
+    accumulate_nonzero_histogram,
+    apply_log1p_chunk,
+    extract_anndata_matrix,
+    histogram_quantiles,
+    iter_matrix_chunks,
+)
+from .types import StreamFeatureStats
+from .utils import (
+    background_cluster_codes as parse_background_cluster_codes,
+    clean_obs_labels,
+    group_rows_by_active_set,
+    max_rss_kb,
+    ordered_union_indices,
+    parse_perturbation_labels,
+    progress_message,
+    ps_score_long_dataframe,
+    to_jsonable,
+)
+
+
+DEFAULT_TARGET_SUM = 1e4
+DEFAULT_CLIP_BINS = 2048
+
+
+@dataclass(frozen=True)
+class ExactFastPsResult:
+    scores: np.ndarray
+    valid_mask: np.ndarray
+    obs_index: np.ndarray
+    labels: np.ndarray
+    control_mask: np.ndarray
+    beta: np.ndarray
+    union_gene_indices: np.ndarray
+    metadata: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ExactFastMultiLabelPsResult:
+    scores: np.ndarray
+    cell_indices: np.ndarray
+    perturbation_indices: np.ndarray
+    perturbations: list[str]
+    valid_mask: np.ndarray
+    obs_index: np.ndarray
+    control_mask: np.ndarray
+    beta: np.ndarray
+    union_gene_indices: np.ndarray
+    metadata: dict[str, Any]
+
+
+@dataclass
+class _BackgroundStats:
+    control_sums: np.ndarray
+    control_counts: np.ndarray
+    perturbation_cluster_counts: np.ndarray
+
+
+def run_ps_score_exact_fast(
+    data: Any,
+    *,
+    mode: Literal["single", "multilabel"] = "single",
+    perturb_column: str,
+    ctrl_name: str,
+    output_dir: str | Path | None = None,
+    layer: str | None = None,
+    perturbations: Sequence[str] | None = None,
+    target_mode: Literal["union_deg", "hvg"] = "union_deg",
+    target_gene_max: int = 500,
+    chunk_size: int = 8192,
+    lr_lambda: float = 0.01,
+    score_lambda: float = 0.0,
+    scale_factor: float = 3.0,
+    target_sum: float = DEFAULT_TARGET_SUM,
+    rank_by_abs_t: bool = True,
+    scale_score: bool = True,
+    logfc_threshold: float | None = 0.1,
+    background_cluster_column: str | None = None,
+    clip_quantile: float | None = None,
+    clip_bins: int = DEFAULT_CLIP_BINS,
+    show_progress: bool = False,
+) -> ExactFastPsResult | ExactFastMultiLabelPsResult | dict[str, Any]:
+    """Run exact-fast PS scoring from an AnnData object or backed h5ad path."""
+
+    assert clip_quantile is None or 0.0 < clip_quantile <= 1.0
+    assert clip_bins >= 2 and type(clip_bins) == int
+    if logfc_threshold is not None and logfc_threshold < 0.0:
+        raise ValueError("logfc_threshold must be >= 0")
+    if target_mode not in {"union_deg", "hvg"}:
+        raise ValueError("target_mode must be 'union_deg' or 'hvg'")
+    if mode not in {"single", "multilabel"}:
+        raise ValueError("mode must be 'single' or 'multilabel'")
+
+    dataset_path = Path(data) if isinstance(data, (str, Path)) else None
+    adata = ad.read_h5ad(dataset_path, backed="r") if dataset_path is not None else data
+    labels = clean_obs_labels(adata, perturb_column)
+    obs_index = np.asarray(adata.obs_names, dtype=object)
+    matrix = extract_anndata_matrix(adata, layer=layer)
+    parsed = parse_perturbation_labels(labels, mode=mode, ctrl_name=ctrl_name, perturbations=perturbations)
+    var_names = np.asarray(adata.var_names, dtype=object)
+    background_cluster_codes, background_cluster_names = parse_background_cluster_codes(adata, background_cluster_column)
+    stage_start = time.perf_counter()
+
+    full_stats_seconds = 0.0
+    clip_threshold_seconds = 0.0
+    full_stats: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None] | None = None
+    linear_sums: np.ndarray | None = None
+    all_gene_clip_values = None
+    if target_mode == "union_deg":
+        progress_message("Finding target genes: streaming group statistics for Welch t ranking.", show_progress)
+    else:
+        progress_message("Finding target genes: using adata.var['highly_variable'].", show_progress)
+    if target_mode == "union_deg" or clip_quantile is not None:
+        progress_desc = "collect DEG/clip stats" if target_mode == "union_deg" and clip_quantile is not None else "collect DEG stats"
+        if target_mode != "union_deg":
+            progress_desc = "collect clip stats"
+        stats_start = time.perf_counter()
+        sums, squared_sums, counts, linear_sums, all_gene_clip_values = _collect_group_stats(
+            matrix,
+            guides=parsed.guides,
+            control_mask=parsed.control_mask,
+            chunk_size=chunk_size,
+            target_sum=target_sum,
+            collect_moments=target_mode == "union_deg",
+            collect_linear_sums=target_mode == "union_deg" and logfc_threshold is not None,
+            clip_quantile=clip_quantile,
+            clip_bins=clip_bins,
+            clip_model_mask=parsed.model_mask if clip_quantile is not None else None,
+            show_progress=show_progress,
+            progress_desc=progress_desc,
+        )
+        first_pass_seconds = time.perf_counter() - stats_start
+        if target_mode == "union_deg":
+            if sums is None or squared_sums is None:
+                raise ValueError("union_deg target mode requires group statistics")
+            full_stats = (sums, squared_sums, counts, linear_sums)
+            full_stats_seconds = first_pass_seconds
+        else:
+            clip_threshold_seconds = first_pass_seconds
+    else:
+        counts = _group_counts(parsed.guides, parsed.control_mask)
+    _check_group_counts(counts, parsed.perturbations)
+
+    targets, target_metadata, target_source = _select_target_genes(
+        adata=adata,
+        target_mode=target_mode,
+        selected_perturbations=parsed.perturbations,
+        var_names=var_names,
+        counts=counts,
+        full_stats=full_stats,
+        target_gene_max=target_gene_max,
+        rank_by_abs_t=rank_by_abs_t,
+        linear_sums=linear_sums,
+        logfc_threshold=logfc_threshold,
+    )
+    union_gene_indices = ordered_union_indices(targets.values())
+    progress_message(
+        f"Selected {union_gene_indices.shape[0]} union target genes across {len(parsed.perturbations)} perturbations.",
+        show_progress,
+    )
+    background_enabled = background_cluster_codes is not None
+
+    clip_values = None if all_gene_clip_values is None else all_gene_clip_values[union_gene_indices]
+
+    clipped_stats_seconds = 0.0
+    ridge_stats_seconds = 0.0
+    background_control_counts: np.ndarray | None = None
+    if mode == "single":
+        background_stats = _new_background_stats(
+            cluster_count=len(background_cluster_names),
+            perturbation_count=parsed.guides.shape[1],
+            feature_count=union_gene_indices.shape[0],
+        ) if background_enabled else None
+        progress_message(
+            "Estimating beta: fitting background-corrected perturbation effects with ridge regression."
+            if background_stats is not None
+            else "Estimating beta: fitting perturbation effect vectors with ridge regression.",
+            show_progress,
+        )
+        if clip_values is None and full_stats is not None and background_stats is None:
+            beta_sums = full_stats[0][:, union_gene_indices]
+        else:
+            clipped_stats_start = time.perf_counter()
+            beta_sums, _, counts, _, _ = _collect_group_stats(
+                matrix,
+                guides=parsed.guides,
+                control_mask=parsed.control_mask,
+                gene_indices=union_gene_indices,
+                clip_values=clip_values,
+                chunk_size=chunk_size,
+                target_sum=target_sum,
+                cluster_codes=background_cluster_codes,
+                background_stats=background_stats,
+                show_progress=show_progress,
+                progress_desc="collect target/background stats" if background_stats is not None else "collect target stats",
+            )
+            clipped_stats_seconds = time.perf_counter() - clipped_stats_start
+        ridge_start = time.perf_counter()
+        background_projection = None
+        if background_stats is not None:
+            cluster_background = _cluster_background_matrix(
+                background_stats,
+                cluster_names=background_cluster_names,
+                needed_clusters=np.unique(background_cluster_codes[parsed.model_mask]),
+            )
+            background_control_counts = background_stats.control_counts
+            beta = _solve_single_label_background_ridge(
+                perturbation_rhs=beta_sums[1:],
+                perturbation_counts=counts[1:].astype(np.float64, copy=False),
+                perturbation_cluster_counts=background_stats.perturbation_cluster_counts,
+                cluster_background=cluster_background,
+                lr_lambda=float(lr_lambda),
+            )
+            background_projection = cluster_background @ beta[1:].T
+        else:
+            beta = _solve_single_label_ridge(
+                total_rhs=beta_sums.sum(axis=0),
+                perturbation_rhs=beta_sums[1:],
+                perturbation_counts=counts[1:].astype(np.float64, copy=False),
+                model_cell_count=float(counts.sum()),
+                lr_lambda=float(lr_lambda),
+            )
+        ridge_seconds = time.perf_counter() - ridge_start
+        scores, valid_mask, max_score_by_perturbation, scoring_seconds = _score_single_label(
+            matrix,
+            guides=parsed.guides,
+            beta=beta,
+            union_gene_indices=union_gene_indices,
+            clip_values=clip_values,
+            chunk_size=chunk_size,
+            target_sum=target_sum,
+            score_lambda=score_lambda,
+            scale_factor=scale_factor,
+            scale_score=scale_score,
+            cluster_codes=background_cluster_codes,
+            background_projection=background_projection,
+            show_progress=show_progress,
+            progress_desc="score cells",
+        )
+    else:
+        background_stats = _new_background_stats(
+            cluster_count=len(background_cluster_names),
+            perturbation_count=parsed.guides.shape[1],
+            feature_count=union_gene_indices.shape[0],
+        ) if background_enabled else None
+        progress_message("Estimating beta: collecting multilabel ridge sufficient statistics.", show_progress)
+        ridge_stats_start = time.perf_counter()
+        xtx, xty = _collect_multilabel_ridge_stats(
+            matrix,
+            guides=parsed.guides,
+            control_mask=parsed.control_mask,
+            union_gene_indices=union_gene_indices,
+            clip_values=clip_values,
+            chunk_size=chunk_size,
+            target_sum=target_sum,
+            cluster_codes=background_cluster_codes,
+            background_stats=background_stats,
+            show_progress=show_progress,
+            progress_desc="collect multilabel ridge stats",
+        )
+        ridge_stats_seconds = time.perf_counter() - ridge_stats_start
+        ridge_start = time.perf_counter()
+        background_projection = None
+        progress_message(
+            "Estimating beta: solving background-corrected multilabel ridge regression."
+            if background_stats is not None
+            else "Estimating beta: solving multilabel ridge regression.",
+            show_progress,
+        )
+        if background_stats is not None:
+            cluster_background = _cluster_background_matrix(
+                background_stats,
+                cluster_names=background_cluster_names,
+                needed_clusters=np.unique(background_cluster_codes[parsed.model_mask]),
+            )
+            background_control_counts = background_stats.control_counts
+            corrected_xty = xty[1:] - background_stats.perturbation_cluster_counts @ cluster_background
+            perturbation_xtx = xtx[1:, 1:].tocsc()
+            perturbation_beta = np.asarray(
+                spsolve(perturbation_xtx + sparse.eye(perturbation_xtx.shape[0], format="csc") * float(lr_lambda), corrected_xty),
+                dtype=np.float64,
+            )
+            if perturbation_beta.ndim == 1:
+                perturbation_beta = perturbation_beta[:, None]
+            beta = np.vstack([np.zeros((1, corrected_xty.shape[1]), dtype=np.float64), perturbation_beta])
+            background_projection = cluster_background @ beta[1:].T
+        else:
+            beta = np.asarray(spsolve(xtx + sparse.eye(xtx.shape[0], format="csc") * float(lr_lambda), xty), dtype=np.float64)
+            if beta.ndim == 1:
+                beta = beta[:, None]
+        ridge_seconds = time.perf_counter() - ridge_start
+        (
+            scores,
+            cell_indices,
+            perturbation_indices,
+            valid_mask,
+            max_score_by_perturbation,
+            scoring_seconds,
+        ) = _score_multilabel(
+            matrix,
+            guides=parsed.guides,
+            beta=beta,
+            union_gene_indices=union_gene_indices,
+            clip_values=clip_values,
+            chunk_size=chunk_size,
+            target_sum=target_sum,
+            score_lambda=score_lambda,
+            scale_factor=scale_factor,
+            scale_score=scale_score,
+            cluster_codes=background_cluster_codes,
+            background_projection=background_projection,
+            show_progress=show_progress,
+            progress_desc="score multilabel cells",
+        )
+
+    _add_score_metadata(
+        target_metadata,
+        parsed.perturbations,
+        beta=beta,
+        max_score_by_perturbation=max_score_by_perturbation,
+        scale_score=scale_score,
+    )
+    metadata = {
+        "algorithm": "ps_score_exact_fast" if mode == "single" else "ps_score_exact_fast_multilabel",
+        "mode": mode,
+        "input_type": f"anndata-{mode}-backed-stream",
+        "layer": layer,
+        "perturb_column": perturb_column,
+        "control_label": ctrl_name,
+        "target_mode": target_mode,
+        "target_gene_source": target_source["mode"],
+        "target_gene_source_detail": target_source,
+        "target_gene_max": int(target_gene_max),
+        "rank_by_abs_t": bool(rank_by_abs_t),
+        "logfc_threshold": None if logfc_threshold is None else float(logfc_threshold),
+        "background_correction": bool(background_enabled),
+        "background_cluster_column": background_cluster_column,
+        "quantile_clip": clip_quantile is not None,
+        "clip_quantile": None if clip_quantile is None else float(clip_quantile),
+        "clip_method": None if clip_quantile is None else "streaming_histogram",
+        "clip_bins": None if clip_quantile is None else int(clip_bins),
+        "chunk_size": int(chunk_size),
+        "target_sum": float(target_sum),
+        "lr_lambda": float(lr_lambda),
+        "score_lambda": float(score_lambda),
+        "scale_factor": float(scale_factor),
+        "scale_score": bool(scale_score),
+        "selected_perturbations": list(parsed.perturbations),
+        "control_cell_count": int(counts[0]),
+        "perturbation_cell_counts": {perturbation: int(counts[index + 1]) for index, perturbation in enumerate(parsed.perturbations)},
+        "union_target_gene_count": int(union_gene_indices.shape[0]),
+        "union_target_genes": [str(var_names[index]) for index in union_gene_indices],
+        "target_gene_metadata": target_metadata,
+        "beta_shape": tuple(int(value) for value in beta.shape),
+        "valid_scored_cell_count": int(np.count_nonzero(valid_mask)),
+        "timings": {
+            "target_stats_seconds": float(full_stats_seconds),
+            "clip_threshold_seconds": float(clip_threshold_seconds),
+            "clipped_sufficient_stats_seconds": float(clipped_stats_seconds),
+            "ridge_sufficient_stats_seconds": float(ridge_stats_seconds),
+            "ridge_solve_seconds": float(ridge_seconds),
+            "scoring_seconds": float(scoring_seconds),
+            "total_seconds": float(time.perf_counter() - stage_start),
+        },
+        "max_rss_kb": max_rss_kb(),
+    }
+    if background_enabled and background_control_counts is not None:
+        metadata["background_cluster_count"] = int(len(background_cluster_names))
+        metadata["background_control_cell_counts"] = {name: int(background_control_counts[index]) for index, name in enumerate(background_cluster_names)}
+    if mode == "single":
+        metadata["score_vector_shape"] = (int(labels.shape[0]), 1)
+        result = ExactFastPsResult(
+            scores=scores,
+            valid_mask=valid_mask,
+            obs_index=obs_index,
+            labels=labels,
+            control_mask=parsed.control_mask,
+            beta=beta,
+            union_gene_indices=union_gene_indices,
+            metadata=metadata,
+        )
+    else:
+        metadata.update(
+            {
+                "guide_multiplicity": _summarize_guide_multiplicity(parsed.active_counts),
+                "scored_pair_count": int(scores.shape[0]),
+            }
+        )
+        result = ExactFastMultiLabelPsResult(
+            scores=scores,
+            cell_indices=cell_indices,
+            perturbation_indices=perturbation_indices,
+            perturbations=list(parsed.perturbations),
+            valid_mask=valid_mask,
+            obs_index=obs_index,
+            control_mask=parsed.control_mask,
+            beta=beta,
+            union_gene_indices=union_gene_indices,
+            metadata=metadata,
+        )
+
+    if output_dir is None:
+        return result
+    return write_ps_score_exact_fast_output(result, output_dir=output_dir, dataset_path=dataset_path)
+
+
+def write_ps_score_exact_fast_output(
+    result: ExactFastPsResult | ExactFastMultiLabelPsResult,
+    *,
+    output_dir: str | Path,
+    dataset_path: str | Path | None = None,
+) -> dict[str, Any]:
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    score_path = output_path / "ps-score-exact-fast.csv"
+    manifest_path = output_path / "ps-score-exact-fast-manifest.json"
+
+    table = _score_result_dataframe(result)
+    table.to_csv(score_path, index=False)
+
+    manifest = dict(result.metadata)
+    manifest.update(
+        {
+            "dataset_path": None if dataset_path is None else str(dataset_path),
+            "score_output_format": "csv_long",
+            "score_count": int(table.shape[0]),
+            "score_output_paths": {"scores": str(score_path)},
+        }
+    )
+    _write_json(manifest, manifest_path)
+    return manifest
+
+
+def _score_result_dataframe(result: ExactFastPsResult | ExactFastMultiLabelPsResult) -> Any:
+    if isinstance(result, ExactFastMultiLabelPsResult):
+        return ps_score_long_dataframe(
+            obs_index=result.obs_index,
+            control_mask=result.control_mask,
+            valid_mask=result.valid_mask,
+            scores=result.scores.astype(np.float64, copy=False),
+            cell_indices=result.cell_indices,
+            perturbation_indices=result.perturbation_indices,
+            perturbations=result.perturbations,
+            ctrl_name=result.metadata["control_label"],
+        )
+
+    scored_rows = np.flatnonzero(result.valid_mask)
+    perturbations = result.metadata["selected_perturbations"]
+    lookup = {perturbation: index for index, perturbation in enumerate(perturbations)}
+    perturbation_indices = np.asarray([lookup[str(label)] for label in result.labels[scored_rows]], dtype=np.int32)
+    return ps_score_long_dataframe(
+        obs_index=result.obs_index,
+        control_mask=result.control_mask,
+        valid_mask=result.valid_mask,
+        scores=result.scores[scored_rows, 0].astype(np.float64, copy=False),
+        cell_indices=scored_rows,
+        perturbation_indices=perturbation_indices,
+        perturbations=perturbations,
+        ctrl_name=result.metadata["control_label"],
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dataset-path", required=True)
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--mode", choices=["single", "multilabel"], default="single")
+    parser.add_argument("--perturb-column", required=True)
+    parser.add_argument("--ctrl-name", required=True)
+    parser.add_argument("--layer")
+    parser.add_argument("--target-mode", choices=["union_deg", "hvg"], default="union_deg")
+    parser.add_argument("--target-gene-max", type=int, default=500)
+    parser.add_argument("--chunk-size", type=int, default=8192)
+    parser.add_argument("--lr-lambda", type=float, default=0.01)
+    parser.add_argument("--score-lambda", type=float, default=0.0)
+    parser.add_argument("--scale-factor", type=float, default=3.0)
+    parser.add_argument("--target-sum", type=float, default=DEFAULT_TARGET_SUM)
+    parser.add_argument("--logfc-threshold", type=float)
+    parser.add_argument("--background-cluster-column")
+    parser.add_argument("--clip-quantile", type=float)
+    parser.add_argument("--clip-bins", type=int, default=DEFAULT_CLIP_BINS)
+    parser.add_argument("--perturbation", action="append", dest="perturbations")
+    parser.add_argument("--progress", action="store_true")
+    parser.add_argument("--rank-by-signed-t", action="store_true")
+    parser.add_argument("--no-scale-score", action="store_true")
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
+    args = build_parser().parse_args(argv)
+    result = run_ps_score_exact_fast(
+        args.dataset_path,
+        mode=args.mode,
+        output_dir=args.output_dir,
+        perturb_column=args.perturb_column,
+        ctrl_name=args.ctrl_name,
+        layer=args.layer,
+        perturbations=args.perturbations,
+        target_mode=args.target_mode,
+        target_gene_max=args.target_gene_max,
+        chunk_size=args.chunk_size,
+        lr_lambda=args.lr_lambda,
+        score_lambda=args.score_lambda,
+        scale_factor=args.scale_factor,
+        target_sum=args.target_sum,
+        rank_by_abs_t=not args.rank_by_signed_t,
+        scale_score=not args.no_scale_score,
+        logfc_threshold=args.logfc_threshold,
+        background_cluster_column=args.background_cluster_column,
+        clip_quantile=args.clip_quantile,
+        clip_bins=args.clip_bins,
+        show_progress=args.progress,
+    )
+    if not isinstance(result, dict):
+        raise TypeError("CLI run did not return an output manifest")
+    return result
+
+
+def cli(argv: Sequence[str] | None = None) -> None:
+    print(json.dumps(to_jsonable(main(argv)), indent=2, sort_keys=True))
+
+
+def _select_target_genes(
+    *,
+    adata: Any,
+    target_mode: str,
+    selected_perturbations: Sequence[str],
+    var_names: np.ndarray,
+    counts: np.ndarray,
+    full_stats: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None] | None,
+    target_gene_max: int,
+    rank_by_abs_t: bool,
+    linear_sums: np.ndarray | None,
+    logfc_threshold: float | None,
+) -> tuple[dict[str, np.ndarray], dict[str, dict[str, Any]], dict[str, Any]]:
+    if target_mode == "hvg":
+        hvg = _hvg_indices(adata)
+        targets = {perturbation: hvg for perturbation in selected_perturbations}
+        source = {"mode": "hvg", "var_column": "highly_variable"}
+        metadata = {
+            perturbation: {
+                "cell_count": int(counts[index + 1]),
+                "selected_gene_count": int(targets[perturbation].shape[0]),
+                "selected_genes": [str(var_names[gene_index]) for gene_index in targets[perturbation]],
+            }
+            for index, perturbation in enumerate(selected_perturbations)
+        }
+    else:
+        if full_stats is None:
+            raise ValueError("union_deg target mode requires streamed full-gene group statistics")
+        sums, squared_sums, _, _ = full_stats
+        control_stats = StreamFeatureStats(count=int(counts[0]), sums=sums[0], squared_sums=squared_sums[0])
+        control_linear_mean = None if linear_sums is None else linear_sums[0] / max(int(counts[0]), 1)
+        targets = {}
+        metadata = {}
+        for perturbation_index, perturbation in enumerate(selected_perturbations, start=1):
+            perturb_stats = StreamFeatureStats(
+                count=int(counts[perturbation_index]),
+                sums=sums[perturbation_index],
+                squared_sums=squared_sums[perturbation_index],
+            )
+            t_scores = welch_t_scores_from_stats(perturb_stats, control_stats)
+            logfc_passing = None
+            if logfc_threshold is not None:
+                if control_linear_mean is None or linear_sums is None:
+                    raise ValueError("logfc_threshold requires streamed normalized means")
+                perturb_linear_mean = linear_sums[perturbation_index] / max(int(counts[perturbation_index]), 1)
+                logfc = log2_fold_change(perturb_linear_mean, control_linear_mean)
+                candidate_indices = np.flatnonzero(np.abs(logfc) > float(logfc_threshold)).astype(np.int64, copy=False)
+                logfc_passing = int(candidate_indices.shape[0])
+                if candidate_indices.size:
+                    ranked = top_k_indices(
+                        t_scores[candidate_indices],
+                        min(target_gene_max, candidate_indices.shape[0]),
+                        absolute=rank_by_abs_t,
+                    )
+                    targets[perturbation] = candidate_indices[ranked].astype(np.int64, copy=False)
+                else:
+                    targets[perturbation] = np.asarray([], dtype=np.int64)
+            else:
+                targets[perturbation] = top_k_indices(
+                    t_scores,
+                    min(target_gene_max, t_scores.shape[0]),
+                    absolute=rank_by_abs_t,
+                ).astype(np.int64, copy=False)
+
+            metadata[perturbation] = {
+                "cell_count": int(counts[perturbation_index]),
+                "selected_gene_count": int(targets[perturbation].shape[0]),
+                "selected_genes": [str(var_names[gene_index]) for gene_index in targets[perturbation]],
+            }
+            if logfc_passing is not None:
+                metadata[perturbation]["logfc_filtered_gene_count"] = logfc_passing
+        source = {
+            "mode": "union_deg",
+            "rank_by_abs_t": bool(rank_by_abs_t),
+            "logfc_threshold": None if logfc_threshold is None else float(logfc_threshold),
+            "logfc_base": 2,
+            "logfc_pseudocount": 1.0,
+        }
+    return targets, metadata, source
+
+
+def _hvg_indices(adata: Any) -> np.ndarray:
+    if "highly_variable" not in adata.var:
+        raise ValueError("target_mode='hvg' requires adata.var['highly_variable']")
+    mask = np.asarray(adata.var["highly_variable"], dtype=bool)
+    indices = np.flatnonzero(mask).astype(np.int64, copy=False)
+    if indices.size == 0:
+        raise ValueError("adata.var['highly_variable'] does not contain any selected genes")
+    return indices
+
+
+def _check_group_counts(counts: np.ndarray, perturbations: Sequence[str]) -> None:
+    if counts[0] == 0:
+        raise ValueError("At least one control cell is required")
+    missing = [perturbation for index, perturbation in enumerate(perturbations) if counts[index + 1] == 0]
+    if missing:
+        raise ValueError("Selected perturbations have no modeled cells: " + ", ".join(missing))
+
+
+def _group_counts(guides: sparse.csr_matrix, control_mask: np.ndarray) -> np.ndarray:
+    counts = np.zeros(guides.shape[1] + 1, dtype=np.int64)
+    counts[0] = int(np.count_nonzero(control_mask))
+    counts[1:] = np.asarray(guides.sum(axis=0)).ravel().astype(np.int64, copy=False)
+    return counts
+
+
+def _collect_group_stats(
+    matrix: Any,
+    *,
+    guides: sparse.csr_matrix,
+    control_mask: np.ndarray,
+    chunk_size: int,
+    target_sum: float,
+    gene_indices: np.ndarray | None = None,
+    clip_values: np.ndarray | None = None,
+    collect_moments: bool = True,
+    collect_linear_sums: bool = False,
+    cluster_codes: np.ndarray | None = None,
+    background_stats: _BackgroundStats | None = None,
+    clip_quantile: float | None = None,
+    clip_bins: int = DEFAULT_CLIP_BINS,
+    clip_model_mask: np.ndarray | None = None,
+    show_progress: bool = False,
+    progress_desc: str | None = None,
+) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray, np.ndarray | None, np.ndarray | None]:
+    if collect_linear_sums and not collect_moments:
+        raise ValueError("linear sums require group moments")
+    if clip_quantile is not None and gene_indices is not None:
+        raise ValueError("histogram clipping collection requires all genes")
+    feature_count = int(matrix.shape[1] if gene_indices is None else gene_indices.shape[0])
+    group_count = guides.shape[1] + 1
+    sums = np.zeros((group_count, feature_count), dtype=np.float64) if collect_moments else None
+    squared_sums = np.zeros_like(sums) if sums is not None else None
+    linear_sums = np.zeros_like(sums) if collect_linear_sums else None
+    counts = np.zeros(group_count, dtype=np.int64)
+    hist = None
+    nonzero_counts = None
+    clip_model_cell_count = 0
+    max_value = float(np.log1p(target_sum))
+    if clip_quantile is not None:
+        if clip_model_mask is None:
+            raise ValueError("clip_quantile requires clip_model_mask")
+        clip_model_cell_count = int(np.count_nonzero(clip_model_mask))
+        if clip_model_cell_count <= 0:
+            raise ValueError("Cannot estimate clip values without model cells")
+        hist = np.zeros((feature_count, int(clip_bins)), dtype=np.uint32)
+        nonzero_counts = np.zeros(feature_count, dtype=np.int64)
+    for start, stop, chunk in iter_matrix_chunks(
+        matrix,
+        n_obs=guides.shape[0],
+        chunk_size=chunk_size,
+        target_sum=target_sum,
+        gene_indices=gene_indices,
+        clip_values=clip_values,
+        apply_log1p=not collect_linear_sums,
+        show_progress=show_progress,
+        progress_desc=progress_desc,
+    ):
+        chunk_control = control_mask[start:stop]
+        if linear_sums is not None:
+            if np.any(chunk_control):
+                _add_group_sums(chunk[chunk_control], row=0, sums=linear_sums)
+            _add_multilabel_group_sums(chunk, guides[start:stop], sums=linear_sums)
+            chunk = apply_log1p_chunk(chunk)
+        if hist is not None and nonzero_counts is not None and clip_model_mask is not None:
+            model_mask = clip_model_mask[start:stop]
+            if np.any(model_mask):
+                accumulate_nonzero_histogram(chunk[model_mask], hist=hist, nonzero_counts=nonzero_counts, max_value=max_value)
+        if background_stats is not None:
+            if cluster_codes is None:
+                raise ValueError("background_stats requires cluster_codes")
+            _add_background_stats(chunk, guides[start:stop], chunk_control, cluster_codes[start:stop], background_stats)
+        if sums is None or squared_sums is None:
+            counts[0] += int(np.count_nonzero(chunk_control))
+            counts[1:] += np.asarray(guides[start:stop].sum(axis=0)).ravel().astype(np.int64, copy=False)
+        elif np.any(chunk_control):
+            _add_group_stats(chunk[chunk_control], row=0, sums=sums, squared_sums=squared_sums, counts=counts)
+        if sums is not None and squared_sums is not None:
+            _add_multilabel_group_stats(chunk, guides[start:stop], sums=sums, squared_sums=squared_sums, counts=counts)
+    clip_values = None
+    if hist is not None and nonzero_counts is not None:
+        zero_counts = np.full(feature_count, clip_model_cell_count, dtype=np.int64) - nonzero_counts
+        clip_values = histogram_quantiles(hist, zero_counts=zero_counts, total_count=clip_model_cell_count, quantile=float(clip_quantile), max_value=max_value)
+    return sums, squared_sums, counts, linear_sums, clip_values
+
+
+def _score_single_label(
+    matrix: Any,
+    *,
+    guides: sparse.csr_matrix,
+    beta: np.ndarray,
+    union_gene_indices: np.ndarray,
+    clip_values: np.ndarray | None,
+    chunk_size: int,
+    target_sum: float,
+    score_lambda: float,
+    scale_factor: float,
+    scale_score: bool,
+    cluster_codes: np.ndarray | None = None,
+    background_projection: np.ndarray | None = None,
+    show_progress: bool = False,
+    progress_desc: str | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    beta_norm_sq = np.einsum("ij,ij->i", beta[1:], beta[1:])
+    baseline_projection = None if background_projection is not None else beta[1:] @ beta[0]
+    codes = _single_codes_from_guides(guides)
+    scores = np.zeros((guides.shape[0], 1), dtype=np.float32)
+    valid_mask = np.zeros(guides.shape[0], dtype=bool)
+    max_score_by_perturbation = np.zeros(beta.shape[0] - 1, dtype=np.float64)
+    start_time = time.perf_counter()
+
+    for start, stop, chunk in iter_matrix_chunks(
+        matrix,
+        n_obs=guides.shape[0],
+        chunk_size=chunk_size,
+        target_sum=target_sum,
+        gene_indices=union_gene_indices,
+        clip_values=clip_values,
+        show_progress=show_progress,
+        progress_desc=progress_desc,
+    ):
+        chunk_codes = codes[start:stop]
+        chunk_cluster_codes = None if cluster_codes is None else cluster_codes[start:stop]
+        row_indices = np.arange(start, stop, dtype=np.int64)
+        for code in np.unique(chunk_codes):
+            if code < 0:
+                continue
+            denominator = beta_norm_sq[int(code)]
+            if denominator <= 0.0:
+                continue
+            mask = chunk_codes == code
+            projected = np.asarray(chunk[mask] @ beta[int(code) + 1], dtype=np.float64).ravel()
+            if background_projection is None:
+                raw = (projected - baseline_projection[int(code)] - score_lambda) / denominator
+            else:
+                if chunk_cluster_codes is None:
+                    raise ValueError("background_projection requires cluster_codes")
+                raw = (projected - background_projection[chunk_cluster_codes[mask], int(code)] - score_lambda) / denominator
+            clipped = np.clip(raw, 0.0, scale_factor) / scale_factor
+            selected_rows = row_indices[mask]
+            scores[selected_rows, 0] = clipped.astype(np.float32, copy=False)
+            valid_mask[selected_rows] = True
+            if clipped.size:
+                max_score_by_perturbation[int(code)] = max(max_score_by_perturbation[int(code)], float(np.max(clipped)))
+
+    if scale_score:
+        valid_indices = np.flatnonzero(valid_mask & (codes >= 0))
+        row_max = max_score_by_perturbation[codes[valid_indices]]
+        nonzero = row_max > 0.0
+        scores[valid_indices[nonzero], 0] /= row_max[nonzero].astype(np.float32, copy=False)
+        scores[valid_indices[~nonzero], 0] = 0.0
+    return scores, valid_mask, max_score_by_perturbation, time.perf_counter() - start_time
+
+
+def _single_codes_from_guides(guides: sparse.csr_matrix) -> np.ndarray:
+    if np.max(np.asarray(guides.getnnz(axis=1)).ravel(), initial=0) > 1:
+        raise ValueError("single mode received cells with multiple perturbations")
+    codes = np.full(guides.shape[0], -1, dtype=np.int32)
+    coo = guides.tocoo()
+    if coo.nnz:
+        codes[coo.row] = coo.col.astype(np.int32, copy=False)
+    return codes
+
+
+def _score_multilabel(
+    matrix: Any,
+    *,
+    guides: sparse.csr_matrix,
+    beta: np.ndarray,
+    union_gene_indices: np.ndarray,
+    clip_values: np.ndarray | None,
+    chunk_size: int,
+    target_sum: float,
+    score_lambda: float,
+    scale_factor: float,
+    scale_score: bool,
+    cluster_codes: np.ndarray | None = None,
+    background_projection: np.ndarray | None = None,
+    show_progress: bool = False,
+    progress_desc: str | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
+    score_values: list[np.ndarray] = []
+    cell_index_values: list[np.ndarray] = []
+    perturbation_index_values: list[np.ndarray] = []
+    max_score_by_perturbation = np.zeros(guides.shape[1], dtype=np.float64)
+    valid_mask = np.zeros(guides.shape[0], dtype=bool)
+    start_time = time.perf_counter()
+
+    for start, stop, chunk in iter_matrix_chunks(
+        matrix,
+        n_obs=guides.shape[0],
+        chunk_size=chunk_size,
+        target_sum=target_sum,
+        gene_indices=union_gene_indices,
+        clip_values=clip_values,
+        show_progress=show_progress,
+        progress_desc=progress_desc,
+    ):
+        row_indices = np.arange(start, stop, dtype=np.int64)
+        chunk_cluster_codes = None if cluster_codes is None else cluster_codes[start:stop]
+        for active_set, local_rows in group_rows_by_active_set(guides[start:stop]).items():
+            active_indices = np.asarray(active_set, dtype=np.int64)
+            active_beta = beta[active_indices + 1]
+            gram = active_beta @ active_beta.T
+            rhs = np.asarray(chunk[local_rows] @ active_beta.T, dtype=np.float64)
+            if background_projection is None:
+                rhs -= (active_beta @ beta[0])[None, :]
+            else:
+                if chunk_cluster_codes is None:
+                    raise ValueError("background_projection requires cluster_codes")
+                rhs -= background_projection[chunk_cluster_codes[local_rows]][:, active_indices]
+            bounded = _solve_bounded_quadratic_scores(
+                gram=gram,
+                rhs=rhs,
+                linear_penalty=float(score_lambda),
+                upper=float(scale_factor),
+            )
+            normalized = bounded / float(scale_factor)
+            global_rows = row_indices[local_rows]
+            valid_mask[global_rows] = True
+            for offset, perturbation_index in enumerate(active_indices):
+                values = normalized[:, offset].astype(np.float32, copy=False)
+                score_values.append(values)
+                cell_index_values.append(global_rows.copy())
+                perturbation_index_values.append(np.full(values.shape[0], int(perturbation_index), dtype=np.int32))
+                if values.size:
+                    max_score_by_perturbation[perturbation_index] = max(max_score_by_perturbation[perturbation_index], float(np.max(values)))
+
+    if score_values:
+        scores = np.concatenate(score_values).astype(np.float32, copy=False)
+        cell_indices = np.concatenate(cell_index_values).astype(np.int64, copy=False)
+        perturbation_indices = np.concatenate(perturbation_index_values).astype(np.int32, copy=False)
+    else:
+        scores = np.zeros(0, dtype=np.float32)
+        cell_indices = np.zeros(0, dtype=np.int64)
+        perturbation_indices = np.zeros(0, dtype=np.int32)
+
+    if scale_score and scores.size:
+        row_max = max_score_by_perturbation[perturbation_indices]
+        nonzero = row_max > 0.0
+        scores[nonzero] /= row_max[nonzero].astype(np.float32, copy=False)
+        scores[~nonzero] = 0.0
+    return scores, cell_indices, perturbation_indices, valid_mask, max_score_by_perturbation, time.perf_counter() - start_time
+
+
+def _collect_multilabel_ridge_stats(
+    matrix: Any,
+    *,
+    guides: sparse.csr_matrix,
+    control_mask: np.ndarray,
+    union_gene_indices: np.ndarray,
+    clip_values: np.ndarray | None,
+    chunk_size: int,
+    target_sum: float,
+    cluster_codes: np.ndarray | None = None,
+    background_stats: _BackgroundStats | None = None,
+    show_progress: bool = False,
+    progress_desc: str | None = None,
+) -> tuple[sparse.csc_matrix, np.ndarray]:
+    perturbation_count = guides.shape[1]
+    xty = np.zeros((perturbation_count + 1, union_gene_indices.shape[0]), dtype=np.float64)
+    intercept_count = 0.0
+    perturbation_counts = np.zeros(perturbation_count, dtype=np.float64)
+    cooccurrence = sparse.csr_matrix((perturbation_count, perturbation_count), dtype=np.float64)
+
+    for start, stop, chunk in iter_matrix_chunks(
+        matrix,
+        n_obs=guides.shape[0],
+        chunk_size=chunk_size,
+        target_sum=target_sum,
+        gene_indices=union_gene_indices,
+        clip_values=clip_values,
+        show_progress=show_progress,
+        progress_desc=progress_desc,
+    ):
+        chunk_guides = guides[start:stop]
+        if background_stats is not None:
+            if cluster_codes is None:
+                raise ValueError("background_stats requires cluster_codes")
+            _add_background_stats(chunk, chunk_guides, control_mask[start:stop], cluster_codes[start:stop], background_stats)
+        active = np.asarray(chunk_guides.getnnz(axis=1)).ravel() > 0
+        model_mask = control_mask[start:stop] | active
+        if not np.any(model_mask):
+            continue
+        chunk = chunk[model_mask]
+        chunk_guides = chunk_guides[model_mask]
+        intercept_count += float(chunk.shape[0])
+        xty[0] += column_sums(chunk)
+        perturbation_counts += np.asarray(chunk_guides.sum(axis=0)).ravel().astype(np.float64, copy=False)
+        cooccurrence = cooccurrence + (chunk_guides.T @ chunk_guides).tocsr()
+        _add_multilabel_xty(chunk, chunk_guides, xty=xty)
+
+    top = sparse.hstack(
+        [sparse.csr_matrix([[intercept_count]], dtype=np.float64), sparse.csr_matrix(perturbation_counts[None, :])],
+        format="csr",
+    )
+    bottom = sparse.hstack([sparse.csr_matrix(perturbation_counts[:, None]), cooccurrence], format="csr")
+    return sparse.vstack([top, bottom], format="csc"), xty
+
+
+def _add_group_stats(matrix: Any, *, row: int, sums: np.ndarray, squared_sums: np.ndarray, counts: np.ndarray) -> None:
+    counts[row] += int(matrix.shape[0])
+    if sparse.issparse(matrix):
+        sums[row] += np.asarray(matrix.sum(axis=0)).ravel().astype(np.float64, copy=False)
+        squared_sums[row] += np.asarray(matrix.power(2).sum(axis=0)).ravel().astype(np.float64, copy=False)
+        return
+    dense = np.asarray(matrix, dtype=np.float64)
+    sums[row] += dense.sum(axis=0)
+    squared_sums[row] += np.square(dense).sum(axis=0)
+
+
+def _add_group_sums(matrix: Any, *, row: int, sums: np.ndarray) -> None:
+    sums[row] += column_sums(matrix)
+
+
+def _add_multilabel_group_stats(matrix: Any, guides: sparse.csr_matrix, *, sums: np.ndarray, squared_sums: np.ndarray, counts: np.ndarray) -> None:
+    coo = guides.tocoo()
+    if coo.nnz == 0:
+        return
+    columns = coo.col
+    rows = coo.row
+    for column in np.unique(columns):
+        _add_group_stats(matrix[rows[columns == column]], row=int(column) + 1, sums=sums, squared_sums=squared_sums, counts=counts)
+
+
+def _add_multilabel_group_sums(matrix: Any, guides: sparse.csr_matrix, *, sums: np.ndarray) -> None:
+    coo = guides.tocoo()
+    if coo.nnz == 0:
+        return
+    columns = coo.col
+    rows = coo.row
+    for column in np.unique(columns):
+        _add_group_sums(matrix[rows[columns == column]], row=int(column) + 1, sums=sums)
+
+
+def _new_background_stats(*, cluster_count: int, perturbation_count: int, feature_count: int) -> _BackgroundStats:
+    return _BackgroundStats(
+        control_sums=np.zeros((cluster_count, feature_count), dtype=np.float64),
+        control_counts=np.zeros(cluster_count, dtype=np.int64),
+        perturbation_cluster_counts=np.zeros((perturbation_count, cluster_count), dtype=np.float64),
+    )
+
+
+def _add_background_stats(
+    matrix: Any,
+    guides: sparse.csr_matrix,
+    control_mask: np.ndarray,
+    cluster_codes: np.ndarray,
+    stats: _BackgroundStats,
+) -> None:
+    if np.any(control_mask):
+        control_clusters = cluster_codes[control_mask]
+        np.add.at(stats.control_counts, control_clusters, 1)
+        for cluster in np.unique(control_clusters):
+            rows = control_mask & (cluster_codes == cluster)
+            _add_group_sums(matrix[rows], row=int(cluster), sums=stats.control_sums)
+    coo = guides.tocoo()
+    if coo.nnz:
+        np.add.at(stats.perturbation_cluster_counts, (coo.col, cluster_codes[coo.row]), 1.0)
+
+
+def _cluster_background_matrix(stats: _BackgroundStats, *, cluster_names: Sequence[str], needed_clusters: np.ndarray) -> np.ndarray:
+    missing = [cluster_names[int(cluster)] for cluster in needed_clusters if stats.control_counts[int(cluster)] == 0]
+    if missing:
+        raise ValueError("background correction requires control cells in each modeled cluster: " + ", ".join(missing))
+    background = np.zeros_like(stats.control_sums)
+    nonzero = stats.control_counts > 0
+    background[nonzero] = stats.control_sums[nonzero] / stats.control_counts[nonzero, None]
+    return background
+
+
+def _add_multilabel_xty(matrix: Any, guides: sparse.csr_matrix, *, xty: np.ndarray) -> None:
+    coo = guides.tocoo()
+    if coo.nnz == 0:
+        return
+    columns = coo.col
+    rows = coo.row
+    for column in np.unique(columns):
+        xty[int(column) + 1] += column_sums(matrix[rows[columns == column]])
+
+
+def _solve_single_label_ridge(
+    *,
+    total_rhs: np.ndarray,
+    perturbation_rhs: np.ndarray,
+    perturbation_counts: np.ndarray,
+    model_cell_count: float,
+    lr_lambda: float,
+) -> np.ndarray:
+    perturbation_denominator = perturbation_counts + lr_lambda
+    weighted_rhs = ((perturbation_counts / perturbation_denominator)[:, None] * perturbation_rhs).sum(axis=0)
+    intercept_denominator = (model_cell_count + lr_lambda) - np.sum(perturbation_counts * perturbation_counts / perturbation_denominator)
+    beta0 = (total_rhs - weighted_rhs) / intercept_denominator
+    perturbation_beta = (perturbation_rhs - perturbation_counts[:, None] * beta0[None, :]) / perturbation_denominator[:, None]
+    return np.vstack([beta0[None, :], perturbation_beta])
+
+
+def _solve_single_label_background_ridge(
+    *,
+    perturbation_rhs: np.ndarray,
+    perturbation_counts: np.ndarray,
+    perturbation_cluster_counts: np.ndarray,
+    cluster_background: np.ndarray,
+    lr_lambda: float,
+) -> np.ndarray:
+    corrected_rhs = perturbation_rhs - perturbation_cluster_counts @ cluster_background
+    perturbation_beta = corrected_rhs / (perturbation_counts + lr_lambda)[:, None]
+    return np.vstack([np.zeros((1, corrected_rhs.shape[1]), dtype=np.float64), perturbation_beta])
+
+
+def _solve_bounded_quadratic_scores(*, gram: np.ndarray, rhs: np.ndarray, linear_penalty: float, upper: float) -> np.ndarray:
+    rhs = np.asarray(rhs, dtype=np.float64)
+    if rhs.ndim == 1:
+        rhs = rhs[:, None]
+    if gram.shape[0] == 1:
+        denominator = float(gram[0, 0])
+        if denominator <= 0.0:
+            return np.zeros((rhs.shape[0], 1), dtype=np.float64)
+        return np.clip((rhs[:, [0]] - linear_penalty) / denominator, 0.0, upper)
+    if gram.shape[0] <= 4:
+        return _solve_bounded_quadratic_scores_active_set(gram=gram, rhs=rhs, linear_penalty=linear_penalty, upper=upper)
+    return _solve_bounded_quadratic_scores_lbfgsb(gram=gram, rhs=rhs, linear_penalty=linear_penalty, upper=upper)
+
+
+def _solve_bounded_quadratic_scores_active_set(*, gram: np.ndarray, rhs: np.ndarray, linear_penalty: float, upper: float) -> np.ndarray:
+    cell_count, variable_count = rhs.shape
+    best = np.zeros((cell_count, variable_count), dtype=np.float64)
+    best_objective = np.full(cell_count, np.inf, dtype=np.float64)
+    for states in product((0, 1, 2), repeat=variable_count):
+        states_array = np.asarray(states, dtype=np.int8)
+        free = states_array == 0
+        upper_fixed = states_array == 2
+        fixed = ~free
+        candidate = np.zeros((cell_count, variable_count), dtype=np.float64)
+        if np.any(upper_fixed):
+            candidate[:, upper_fixed] = upper
+        if np.any(free):
+            free_rhs = rhs[:, free] - linear_penalty
+            if np.any(fixed):
+                free_rhs -= candidate[:, fixed] @ gram[np.ix_(fixed, free)]
+            gram_free = gram[np.ix_(free, free)]
+            try:
+                candidate[:, free] = np.linalg.solve(gram_free, free_rhs.T).T
+            except np.linalg.LinAlgError:
+                candidate[:, free] = np.linalg.lstsq(gram_free, free_rhs.T, rcond=None)[0].T
+        feasible = np.all(candidate >= -1e-9, axis=1) & np.all(candidate <= upper + 1e-9, axis=1)
+        if not np.any(feasible):
+            continue
+        candidate = np.clip(candidate, 0.0, upper)
+        objective = _bounded_quadratic_objective(candidate, gram=gram, rhs=rhs, linear_penalty=linear_penalty)
+        update = feasible & (objective < best_objective)
+        if np.any(update):
+            best[update] = candidate[update]
+            best_objective[update] = objective[update]
+    return best
+
+
+def _solve_bounded_quadratic_scores_lbfgsb(*, gram: np.ndarray, rhs: np.ndarray, linear_penalty: float, upper: float) -> np.ndarray:
+    scores = np.zeros_like(rhs, dtype=np.float64)
+    bounds = [(0.0, upper)] * rhs.shape[1]
+    for row_index, row_rhs in enumerate(rhs):
+        def objective(value: np.ndarray) -> float:
+            return float(0.5 * value @ gram @ value - row_rhs @ value + linear_penalty * np.sum(value))
+
+        def gradient(value: np.ndarray) -> np.ndarray:
+            return gram @ value - row_rhs + linear_penalty
+
+        result = minimize(objective, np.zeros(rhs.shape[1], dtype=np.float64), jac=gradient, bounds=bounds, method="L-BFGS-B")
+        scores[row_index] = np.clip(result.x, 0.0, upper)
+    return scores
+
+
+def _bounded_quadratic_objective(scores: np.ndarray, *, gram: np.ndarray, rhs: np.ndarray, linear_penalty: float) -> np.ndarray:
+    return 0.5 * np.sum((scores @ gram) * scores, axis=1) - np.sum(rhs * scores, axis=1) + linear_penalty * np.sum(scores, axis=1)
+
+
+def _add_score_metadata(
+    metadata: dict[str, dict[str, Any]],
+    perturbations: Sequence[str],
+    *,
+    beta: np.ndarray,
+    max_score_by_perturbation: np.ndarray,
+    scale_score: bool,
+) -> None:
+    beta_norm_sq = np.einsum("ij,ij->i", beta[1:], beta[1:])
+    for index, perturbation in enumerate(perturbations):
+        metadata[perturbation]["beta_norm_sq"] = float(beta_norm_sq[index])
+        metadata[perturbation]["max_score_before_column_scale"] = float(max_score_by_perturbation[index])
+        metadata[perturbation]["column_scaled"] = bool(scale_score and max_score_by_perturbation[index] > 0.0)
+
+
+def _summarize_guide_multiplicity(active_counts: np.ndarray) -> dict[str, Any]:
+    return {
+        "min": int(np.min(active_counts)) if active_counts.size else 0,
+        "max": int(np.max(active_counts)) if active_counts.size else 0,
+        "mean": float(np.mean(active_counts)) if active_counts.size else 0.0,
+        "zero_count": int(np.count_nonzero(active_counts == 0)),
+        "single_count": int(np.count_nonzero(active_counts == 1)),
+        "multi_count": int(np.count_nonzero(active_counts >= 2)),
+    }
+
+
+def _write_json(value: Any, path: Path) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(to_jsonable(value), handle, indent=2, sort_keys=True)
+        handle.write("\n")
+
+
+__all__ = [
+    "ExactFastMultiLabelPsResult",
+    "ExactFastPsResult",
+    "build_parser",
+    "cli",
+    "main",
+    "run_ps_score_exact_fast",
+    "write_ps_score_exact_fast_output",
+]
+
+
+if __name__ == "__main__":
+    cli()

@@ -1,152 +1,112 @@
-# Perturbation-Response Score in python implementation
+# PS_python
 
-A Python pipeline for quantifying and visualizing perturbation efficiency in single-cell CRISPR screen (Perturb-seq) data. The pipeline computes per-cell **Perturbation-response Scores (PS)** using a translated scMAGeCK EM algorithm, projects cells onto a shared LDA-based UMAP, and generates diagnostic scatter plots for 50 target TFs.This PS score is inspired from R version. 
+`PS_python` contains Python tools for perturbation-response score analysis in single-cell perturbation screens.
 
-See our [paper](https://www.nature.com/articles/s41556-025-01626-9) for more details.
+The current maintained scorer is the streamed `exact_fast` implementation imported from `pertscore-py`. It calculates perturbation scores from `.h5ad` perturb-seq data while avoiding full dense score-matrix materialization.
 
----
+The original PS_python demo pipeline is still present in this merge and will be kept as a legacy/example workflow in a follow-up layout cleanup.
 
-## Repository Structure
+## What The Exact-Fast PS Score Does
 
-```
-Petrubation_analysis/
-├── README.md                # This file
-├── PertPS.py                # Main analysis pipeline
-├── pertps_project/          # Local `pertps` Python package
-└── demo/                    # Example input data and output plots
-    ├── PertTF_Subset_100MB.h5ad
-    ├── BARCODE_10x_Merged.txt
-    ├── CTNNB1_Fixed_LDA.png
-    ├── EZH2_Fixed_LDA.png
-    └── SMARCC1_Fixed_LDA.png
-```
+For each perturbation, the method identifies target genes, fits perturbation effect vectors from normalized expression, and scores each perturbed cell against the effect vector for its observed perturbation. Scores are bounded between `0` and `scale_factor`, then scaled to `0-1` by default.
 
----
+In the default `target_mode="union_deg"`, target genes are selected per perturbation by comparing perturbed cells against control cells with streamed Welch t-statistics. Genes can first be filtered by absolute log2 fold change with `logfc_threshold`, then ranked by absolute Welch t-score.
 
-## The `demo/` Folder
+After target genes are selected, the method solves two main optimization problems:
 
-The `demo/` folder contains example input files and example output plots to help you understand what the pipeline expects and produces.
+- Ridge regression estimates each perturbation effect vector, called `beta`, on the union target gene set.
+- In multilabel mode, bounded quadratic optimization assigns per-perturbation scores for cells with multiple active perturbations.
 
-### Example Input Data
+The implementation is designed for large `.h5ad` files. It streams expression chunks from disk, preserves sparse structure where possible, and writes a long CSV table of per-cell scores.
 
-| File | Description |
-|------|-------------|
-| `PertTF_Subset_100MB.h5ad` | AnnData object with 15,000 single cells and a full gene expression matrix (gzip-compressed, ~100 MB). This is the primary input to the pipeline. |
-| `BARCODE_10x_Merged.txt` | Tab-separated file mapping each cell barcode to its CRISPR perturbation target gene. The `cell` column contains barcodes; the `gene` column contains the target gene name. Library prefixes (e.g. `S1L1_`, `S2L2_`) are stripped automatically at runtime. |
+## Input Expectations
 
-### Example Output Plots
+- Input is an `.h5ad` file or an in-memory `AnnData` object.
+- Expression should be raw/count-like, nonnegative values in `adata.X` or a selected `adata.layers[...]` layer.
+- The method internally applies library-size normalization to `target_sum=10000` followed by `log1p`.
+- If `adata.X` is already log-normalized, put raw counts in a layer and pass that layer name.
+- Multilabel perturbations are represented with `+`, for example `GENE1+GENE2`.
 
-Three example output plots are included to show what a successful knockdown looks like on the fixed LDA UMAP:
-
-| File | Gene |
-|------|------|
-| `CTNNB1_Fixed_LDA.png` | CTNNB1 — Wnt pathway transcription factor |
-| `EZH2_Fixed_LDA.png` | EZH2 — PRC2 complex histone methyltransferase |
-| `SMARCC1_Fixed_LDA.png` | SMARCC1 — SWI/SNF chromatin remodeling complex subunit |
-
----
-
-## Background
-
-This project analyzes a 10x Genomics CRISPR perturbation screen targeting 50 transcription factors involved in chromatin regulation and pluripotency. For each target gene, the pipeline:
-
-1. Maps cell barcodes to their assigned perturbation (knockdown) identity.
-2. Computes a **Perturbation Score (PS)** — a per-cell probability (0–1) that a guide RNA successfully knocked down the target gene, estimated via an EM algorithm adapted from scMAGeCK.
-3. Trains a **Linear Discriminant Analysis (LDA)** model on perturbed cells to build a shared low-dimensional embedding.
-4. Visualizes PS scores overlaid on the fixed LDA UMAP.
-5. Generates **quadrant scatter plots** (PS Score vs. Expression) to classify cells into biological categories.
-
----
-
-## Target Genes (50 TFs)
-
-The below are the list , you can have your own list or set of files that you are interested to examine
-```
-SMARCC1  TCF7L2   HMGA2    AFF4     HIF1A    TCF7L1   SMARCA4  CTNNB1
-NFIB     TCF12    SMAD3    EZH2     REST     HDAC1    ARID1B   SMARCB1
-CREBBP   SALL4    SMAD4    SUZ12    SMARCD2  ARID1A   ARNT     EP300
-CLOCK    JARID2   SMARCD1  KLF6     SMARCC2  SOX2     PAX5     POU5F1
-EED      TCF7     SMARCA2  BATF     SMARCD3  OR2F1    ESRRB    OR2AG2
-NANOG    KLF4     OR2D3    TFCP2L1  OR2A25   OR6A2    TBX3     LEF1
-RUNX1    MYC
-```
-
----
-
-## Dependencies
+## Install Locally
 
 ```bash
-pip install scanpy anndata pandas numpy matplotlib seaborn tqdm scipy
-pip install -e demo/pertps_project/
+pip install -e .
 ```
 
----
+## CLI Usage
 
-## Usage
-
-Run the pipeline from inside the `demo/` folder:
+Single-label perturbations, using counts in `adata.X`:
 
 ```bash
-python PertPS.py
+ps_score_exact_fast \
+  --dataset-path input.h5ad \
+  --output-dir ps_out \
+  --mode single \
+  --perturb-column perturbation \
+  --ctrl-name control \
+  --target-mode union_deg \
+  --target-gene-max 500 \
+  --logfc-threshold 0.1 \
+  --clip-quantile 0.95 \
+  --chunk-size 8192 \
+  --progress
 ```
 
-The script will:
+If raw counts are in a layer:
 
-1. Load `PertTF_Subset_100MB.h5ad` and `BARCODE_10x_Merged.txt`.
-2. Strip library prefixes and map barcodes to target gene identities.
-3. Compute PS scores for all 50 TFs and store them in `adata.obs` (e.g. `CTNNB1_eff`).
-4. Save per-gene score tables to `tables_batch/<GENE>_PS_Scores.csv` (created automatically).
-5. Train the global LDA model and generate UMAP coordinates.
-6. Save fixed-LDA overlay plots to `plots_fixed_lda/`.
-7. Save labeled diagnostic scatter plots to `plots_scatter_validation/`.
+```bash
+ps_score_exact_fast \
+  --dataset-path input.h5ad \
+  --output-dir ps_out \
+  --mode single \
+  --perturb-column perturbation \
+  --ctrl-name control \
+  --layer counts
+```
 
----
+Multilabel perturbations:
 
-## Output Description
+```bash
+ps_score_exact_fast \
+  --dataset-path input.h5ad \
+  --output-dir ps_out \
+  --mode multilabel \
+  --perturb-column perturbation \
+  --ctrl-name control
+```
 
-### `plots_fixed_lda/` (generated | not shown here due to size)
-UMAP plots with PS scores overlaid on a shared LDA embedding trained on all perturbed cells. A global summary plot highlights high-confidence knockdown cells.
+Outputs:
 
-### `plots_scatter_validation/` (generated | not shown here due to size)
-Labeled quadrant scatter plots (Perturbation Score vs. normalized target gene expression) for each TF. Cells are classified into four quadrants:
+```text
+ps_out/ps-score-exact-fast.csv
+ps_out/ps-score-exact-fast-manifest.json
+```
 
-| Quadrant | Interpretation |
-|----------|----------------|
-| Top-right (High PS, High Expr) | **Escapers** — guide likely failed; gene still expressed |
-| Bottom-right (High PS, Low Expr) | **Successful KD** — knockdown confirmed |
-| Top-left (Low PS, High Expr) | **Control / WT** — unperturbed cells |
-| Bottom-left (Low PS, Low Expr) | **Low Signal** — ambiguous / low-quality cells |
+## Python API Usage
 
----
+```python
+from pertscore import run_ps_score_exact_fast
 
-## Example Validation Plots
+manifest = run_ps_score_exact_fast(
+    "input.h5ad",
+    output_dir="ps_out",
+    mode="single",
+    perturb_column="perturbation",
+    ctrl_name="control",
+    show_progress=True,
+)
+```
 
-### CTNNB1
-<img src="demo/CTNNB1_Fixed_LDA.png" width="600" alt="CTNNB1 Validation"/>
+## Legacy PS_python Pipeline
 
-### EZH2
-<img src="demo/EZH2_Fixed_LDA.png" width="600" alt="EZH2 Validation"/>
+The original pipeline analyzes a 10x Genomics CRISPR perturbation screen targeting 50 transcription factors. It maps barcodes to perturbation identities, computes per-gene PS scores, trains an LDA/UMAP embedding, and generates diagnostic plots.
 
-### SMARCC1
-<img src="demo/SMARCC1_Fixed_LDA.png" width="600" alt="SMARCC1 Validation"/>
+This legacy workflow is retained for continuity with prior PS_python usage and demo figures.
 
-## Notes
+## Citation
 
-- The pipeline handles non-unique cell barcodes automatically via `obs_names_make_unique()`.
-- Library prefix stripping (`S1L1_`, `S1L2_`, `S2L1_`, `S2L2_`, etc.) is done by splitting on `_` and taking the last token.
-- Background cells in scatter plots are downsampled to 2,000 for visual clarity; the PS boundary threshold is 0.5.
-- The negative control population is labeled `"Non-Targeting"` in the barcode table.
-- For better result please use the complete h5ad file , the above one is just example 
----
-
-
-### Citation
-Song B, Liu D, Dai W, McMyn NF, Wang Q, Yang D, Krejci A, Vasilyev A, Untermoser N, Loregger A, Song D, Williams B, Rosen B, Cheng X, Chao L, Kale HT, Zhang H, Diao Y, Bürckstümmer T, Siliciano JD, Li JJ, Siliciano RF, Huangfu D, Li W. Decoding heterogeneous single-cell perturbation responses. Nat Cell Biol. 2025 Mar;27(3):493-504. doi: 10.1038/s41556-025-01626-9. Epub 2025 Feb 26. PMID: 40011559; PMCID: PMC11906366.
-
-pertTF: context-aware AI modeling for genome-scale and cross-system perturbation prediction
-Yangqi Su, Dingyu Liu, Vipin Menon, Bicna Song, Samuel Boccara, Nan Zhang, Huan Zhao, Jiahui Hazel Zhao, Lei Wang, Nan Hu, Mpathi Nzima, Alon Katz, Bharath Kumar Swargam, Seth A. Ament, Yarui Diao, Hanrui Zhang, Lumen Chao, Gary Hon, Danwei Huangfu, Wei Li
-bioRxiv 2026.03.12.711379; doi: https://doi.org/10.64898/2026.03.12.711379
+Song B, Liu D, Dai W, McMyn NF, Wang Q, Yang D, Krejci A, Vasilyev A, Untermoser N, Loregger A, Song D, Williams B, Rosen B, Cheng X, Chao L, Kale HT, Zhang H, Diao Y, Buerckstuemmer T, Siliciano JD, Li JJ, Siliciano RF, Huangfu D, Li W. Decoding heterogeneous single-cell perturbation responses. Nat Cell Biol. 2025 Mar;27(3):493-504. doi: 10.1038/s41556-025-01626-9.
 
 ## License
 
-This repository is part of the **weili-lab** research codebase. Please contact the lab for usage and citation information.
+This repository is part of the weili-lab research codebase. Please contact the lab for usage and citation information.
