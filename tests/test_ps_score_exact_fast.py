@@ -7,7 +7,7 @@ from anndata import AnnData
 from scipy import sparse
 from scipy.optimize import minimize
 
-from pertscore.ps_score_exact_fast import _select_target_genes, main, run_ps_score_exact_fast
+from pertps.ps_score_exact_fast import _select_target_genes, main, run_ps_score_exact_fast
 
 
 def test_multilabel_matches_single_label_when_one_perturbation_per_cell() -> None:

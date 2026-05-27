@@ -1,4 +1,4 @@
-"""Small generic helpers shared across pertscore modules."""
+"""Small generic helpers shared across pertps modules."""
 
 from __future__ import annotations
 
@@ -255,7 +255,7 @@ def max_rss_kb() -> int:
 
 def progress_message(message: str, show_progress: bool) -> None:
     if show_progress:
-        print(f"[pertscore] {message}", file=sys.stderr, flush=True)
+        print(f"[pertps] {message}", file=sys.stderr, flush=True)
 
 
 def to_jsonable(value: Any) -> Any:

@@ -2,9 +2,23 @@
 
 `PS_python` contains Python tools for perturbation-response score analysis in single-cell perturbation screens.
 
-The current maintained scorer is the streamed `exact_fast` implementation imported from `pertscore-py`. It calculates perturbation scores from `.h5ad` perturb-seq data while avoiding full dense score-matrix materialization.
+The current maintained scorer is the streamed `exact_fast` implementation, exposed as the `pertps` Python package. It calculates perturbation scores from `.h5ad` perturb-seq data while avoiding full dense score-matrix materialization.
 
-The original PS_python demo pipeline is still present in this merge and will be kept as a legacy/example workflow in a follow-up layout cleanup.
+The original PS_python demo pipeline is retained under `examples/legacy_ps_python/` for continuity with prior usage and demo figures.
+
+## Repository Layout
+
+```text
+PS_python/
+├── pyproject.toml
+├── README.md
+├── src/pertps/                     # maintained exact-fast PS scorer
+├── tests/                          # exact-fast unit tests
+└── examples/legacy_ps_python/      # original PS_python demo pipeline
+    ├── PertPS.py
+    ├── pertps_project/
+    └── demo/
+```
 
 ## What The Exact-Fast PS Score Does
 
@@ -85,7 +99,7 @@ ps_out/ps-score-exact-fast-manifest.json
 ## Python API Usage
 
 ```python
-from pertscore import run_ps_score_exact_fast
+from pertps import run_ps_score_exact_fast
 
 manifest = run_ps_score_exact_fast(
     "input.h5ad",
@@ -101,7 +115,13 @@ manifest = run_ps_score_exact_fast(
 
 The original pipeline analyzes a 10x Genomics CRISPR perturbation screen targeting 50 transcription factors. It maps barcodes to perturbation identities, computes per-gene PS scores, trains an LDA/UMAP embedding, and generates diagnostic plots.
 
-This legacy workflow is retained for continuity with prior PS_python usage and demo figures.
+To run the legacy workflow, use:
+
+```bash
+cd examples/legacy_ps_python
+pip install -e pertps_project
+python PertPS.py
+```
 
 ## Citation
 
