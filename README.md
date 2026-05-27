@@ -1,6 +1,8 @@
-# Perturbation Analysis 
+# Perturbation-Response Score in python implementation
 
-A Python pipeline for quantifying and visualizing perturbation efficiency in single-cell CRISPR screen (Perturb-seq) data. The pipeline computes per-cell **Perturbation Scores (PS)** using a translated scMAGeCK EM algorithm, projects cells onto a shared LDA-based UMAP, and generates diagnostic scatter plots for 50 target TFs.This PS score is inspired from R version. 
+A Python pipeline for quantifying and visualizing perturbation efficiency in single-cell CRISPR screen (Perturb-seq) data. The pipeline computes per-cell **Perturbation-response Scores (PS)** using a translated scMAGeCK EM algorithm, projects cells onto a shared LDA-based UMAP, and generates diagnostic scatter plots for 50 target TFs.This PS score is inspired from R version. 
+
+See our [paper](https://www.nature.com/articles/s41556-025-01626-9) for more details.
 
 ---
 
